@@ -202,3 +202,10 @@ smoke_live_app_failure.png
 
 # Evaluation run artefacts (reports contain full model output)
 evals/runs/
+# Ab-benchmark results (also full model output; local only)
+ab_result.json
+evals/ab_*.json
+
+# Local-only working notes and internal docs. Kept on disk, never published.
+.workbuddy/
+docs/
