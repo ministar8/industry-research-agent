@@ -1,0 +1,65 @@
+[
+  {
+    "id": "ess-cell-cn-2025",
+    "title": "储能电芯出货排名：噪声长文本 + 表格 + 排除上游",
+    "message": "你好啊，我最近在做投资，特别关注新能源赛道，之前看过几份报告但都不太系统。麻烦你帮我看看 2025 年国内储能电芯的出货量排名和价格走势，时间只要 2025 年，地区限中国，能用表格呈现最好，另外别把上游锂矿那些扯进来。谢谢！",
+    "checks": [
+      "constraint:2025",
+      "constraint:中国",
+      "constraint:表格",
+      "exclude:锂矿",
+      "table",
+      "anchors",
+      "sources_min:6",
+      "caveat"
+    ]
+  },
+  {
+    "id": "swap-truck-2024",
+    "title": "换电重卡：要求要点式、排除乘用车",
+    "message": "上周跟同事吃饭聊到重卡电动化，他一直在说换电模式，我觉得有点意思但没细看。能不能帮我梳理一下 2024 年国内换电重卡的销量规模和主要运营商的份额，按要点列出来，不用表格。另外别提乘用车换电，那个跟这事没关系。",
+    "checks": [
+      "constraint:2024",
+      "exclude:乘用车",
+      "bullets",
+      "anchors",
+      "sources_min:5"
+    ]
+  },
+  {
+    "id": "catl-byd-europe",
+    "title": "双主体对比：宁德时代 vs 比亚迪欧洲产能",
+    "message": "在准备一份材料，需要对比宁德时代和比亚迪在欧洲的动力电池产能布局，包括在建和已投产的工厂，时间上以 2023 年之后的信息为准。两家的结论要分开写清楚，别混在一起，也不用给我推荐股票。",
+    "checks": [
+      "constraint:欧洲",
+      "constraint:2023",
+      "mention:宁德时代",
+      "mention:比亚迪",
+      "anchors",
+      "sources_min:6",
+      "sections"
+    ]
+  },
+  {
+    "id": "reducer-substitution",
+    "title": "技术路线研判：减速器国产替代（时间不限）",
+    "message": "我们组下周要做一次行业分享，主题是工业机器人减速器的国产替代。想了解目前进展到什么程度、卡在哪些环节，最好能说清谐波和 RV 两条路线各自的差别。时间不限，中外来源都可以用。",
+    "checks": [
+      "mention:减速器",
+      "mention:谐波",
+      "sections",
+      "anchors",
+      "sources_min:6",
+      "caveat"
+    ]
+  },
+  {
+    "id": "no-research-object",
+    "title": "负样本：无可调研对象，应返回提示而非失败",
+    "message": "最近项目太累了，先随便聊聊吧，改天有空再研究你说的那个调研的事。",
+    "checks": [
+      "hint",
+      "sources_max:0"
+    ]
+  }
+]

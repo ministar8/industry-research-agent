@@ -1,0 +1,384 @@
+"""Helpers shared by the research graph nodes."""
+
+import json
+import logging
+import re
+from collections.abc import Sequence
+from typing import Any
+from urllib.parse import urlparse, urlunsplit
+
+from langchain_core.exceptions import OutputParserException
+from langchain_core.messages import AnyMessage, SystemMessage
+from langchain_core.runnables import RunnableConfig
+from openai import LengthFinishReasonError
+from pydantic import BaseModel, ValidationError
+
+from agents.research_team.state import Source
+from core import get_model, settings
+from core.llm import ModelT
+from core.metrics import record_degradation, record_usage
+from schema.models import AllModelEnum
+
+_LANG_SEGMENT = re.compile(r"/(?:zh-cn|zh-tw|cn|tw|hk|en|zh)(?=/|$)", re.IGNORECASE)
+
+logger = logging.getLogger(__name__)
+
+_AUTHORITY_BASE = {4: 0.90, 3: 0.80, 2: 0.65, 1: 0.50, 0: 0.40}
+
+# How much of a source the analyst and writer actually read. Fetch stores up to
+# MAX_CONTENT_CHARS, so a lower cap silently discards paid-for text *and* hides the
+# discard from the model, which then reads "absent" where the truth is "cut off".
+EXCERPT_CHARS = 1500
+
+
+def resolve_model(config: RunnableConfig | None = None) -> ModelT:
+    configured = config.get("configurable", {}).get("model") if config else None
+    model_name: AllModelEnum | None = configured or settings.DEFAULT_MODEL
+    if model_name is None:
+        raise ValueError("No default model configured")
+    return get_model(model_name)
+
+
+# Whether a provider accepts `response_format: json_schema`, keyed by model id.
+# Unknown providers are probed once; a 400 flips the entry to False for the process.
+_STRICT_SUPPORTED: dict[str, bool] = {}
+
+_LENGTH_RETRY = SystemMessage(
+    content="上一次输出超出长度上限被截断。请压缩篇幅后重新输出："
+    "摘要不超过 4 句，主要发现不超过 5 条，分析不超过 300 字，结论不超过 150 字。"
+)
+
+
+def structured_output(model: Any, schema: type, label: str = "") -> Any:
+    """Bind a pydantic schema, preferring constrained decoding.
+
+    `json_schema` is the reliable path: the provider constrains generation, so the
+    model cannot emit prose, a bare array, or token ids. DashScope supports it;
+    DeepSeek's own endpoint does not ("This response_format type is unavailable
+    now"), and forcing `tool_choice` is rejected under thinking mode.
+
+    So: try strict first, and on a 400 that names `response_format`, fall back to
+    JSON mode with the schema serialised into the prompt. Without that hint the
+    model invents key names (`next_agent` instead of `next`).
+
+    `include_raw=True` keeps the AIMessage, which is the only place token usage is
+    readable once the output has been reduced to a pydantic model.
+    """
+    return _StructuredOutput(model, schema, label)
+
+
+class _StructuredOutput:
+    def __init__(self, model: Any, schema: type, label: str = "") -> None:
+        self._model = model
+        self._schema = schema
+        self._label = label or "-"
+        # Capability belongs to the endpoint, not the model name: the same id can be
+        # served by a provider that rejects json_schema.
+        self._key = (
+            f"{getattr(model, 'model_name', '') or id(model)}"
+            f"@{getattr(model, 'openai_api_base', '') or ''}"
+        )
+        self._api_schema = inline_schema(schema.model_json_schema())
+        self._hint = _schema_hint(self._api_schema)
+        self._strict: Any = None
+        self._loose: Any = None
+
+    async def ainvoke(self, messages: list[AnyMessage]) -> Any:
+        try:
+            return await self._attempt(messages)
+        except LengthFinishReasonError as exc:
+            # The writer can overrun the ceiling on a source-heavy turn. Failing the
+            # whole request wastes the retrieval and analysis already paid for, so
+            # retry once with an explicit budget instead of surfacing the error.
+            _record_failed_usage(exc, self._label)
+            logger.warning(
+                "%s hit the completion ceiling, retrying with a tighter brief", self._key
+            )
+            record_degradation("length_retry")
+            return await self._attempt([*messages, _LENGTH_RETRY])
+
+    async def _attempt(self, messages: list[AnyMessage]) -> Any:
+        if _STRICT_SUPPORTED.get(self._key, True):
+            try:
+                result = await self._strict_call(messages)
+            except Exception as exc:
+                if not _rejects_json_schema(exc):
+                    raise
+                _STRICT_SUPPORTED[self._key] = False
+                logger.warning(
+                    "%s rejected json_schema, falling back to JSON mode: %s", self._key, exc
+                )
+            else:
+                parsed = _coerce(result.get("parsed"), self._schema)
+                if parsed is None:
+                    parsed = self._repair(result.get("raw"))
+                if parsed is not None:
+                    return parsed
+        return await self._loose_call(messages)
+
+    async def _strict_call(self, messages: list[AnyMessage]) -> dict[str, Any]:
+        if self._strict is None:
+            self._strict = self._model.with_structured_output(
+                self._api_schema, method="json_schema", include_raw=True
+            )
+        result = await self._strict.ainvoke(messages)
+        record_usage(getattr(result.get("raw"), "usage_metadata", None), self._label)
+        return result
+
+    async def _loose_call(self, messages: list[AnyMessage]) -> Any:
+        if self._loose is None:
+            self._loose = self._model.with_structured_output(
+                self._schema, method="json_mode", include_raw=True
+            )
+        payload = [self._hint, *messages]
+        result = await self._call(payload)
+        parsed = _coerce(result.get("parsed"), self._schema) or self._repair(result.get("raw"))
+        if parsed is None:
+            # One retry: JSON mode occasionally returns prose or a bare array.
+            result = await self._call(payload)
+            parsed = _coerce(result.get("parsed"), self._schema) or self._repair(result.get("raw"))
+        if parsed is None:
+            raise OutputParserException(
+                f"Structured output could not be parsed: {result.get('parsing_error')}"
+            )
+        return parsed
+
+    async def _call(self, payload: list[AnyMessage]) -> dict[str, Any]:
+        assert self._loose is not None
+        result = await self._loose.ainvoke(payload)
+        record_usage(getattr(result.get("raw"), "usage_metadata", None), self._label)
+        return result
+
+    def _repair(self, raw: Any) -> Any | None:
+        """Recover the shapes json_mode still lets through.
+
+        Observed against DashScope: the model wraps the object in one or two
+        single-element arrays (`[[{...}]]`), so the schema rejects a perfectly
+        usable answer. Only single-element wrappers are unwrapped — anything else
+        is a real mismatch and should surface as an error.
+        """
+        content = getattr(raw, "content", None)
+        if isinstance(content, list):
+            # Some providers return content blocks instead of a plain string.
+            content = "".join(
+                part.get("text", "") if isinstance(part, dict) else str(part) for part in content
+            )
+        if not isinstance(content, str):
+            return None
+        text = content.strip()
+        if text.startswith("```"):
+            text = re.sub(r"^```[a-zA-Z]*\s*", "", text)
+            text = re.sub(r"\s*```$", "", text).strip()
+        try:
+            data = json.loads(text)
+        except ValueError:
+            return None
+        while isinstance(data, list) and len(data) == 1:
+            data = data[0]
+        if isinstance(data, str):
+            try:
+                data = json.loads(data)
+            except ValueError:
+                return None
+        if not isinstance(data, dict):
+            return None
+        try:
+            return self._schema.model_validate(data)
+        except ValidationError:
+            return None
+
+
+def _record_failed_usage(exc: Exception, label: str = "-") -> None:
+    """Count the tokens a failed call still cost.
+
+    A length-capped completion is billed in full but never returns, so without this
+    the turn metrics understate both spend and the real cost of retrying.
+    """
+    usage = getattr(getattr(exc, "completion", None), "usage", None)
+    if usage is None:
+        return
+    record_usage(
+        {
+            "input_tokens": getattr(usage, "prompt_tokens", 0),
+            "output_tokens": getattr(usage, "completion_tokens", 0),
+        },
+        label,
+    )
+
+
+def inline_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """Resolve `$ref`/`$defs` into a self-contained JSON schema.
+
+    Pydantic emits `$ref: "#/$defs/TableBlock"` for every nested model. DashScope's
+    grammar compiler chokes on it ("Cannot find field $defs in #/$defs/TableBlock",
+    surfaced as a 503), and any provider that resolves refs lazily has the same
+    failure mode. Inlining removes the indirection; the graph's models are shallow,
+    so there is no recursion to guard against.
+    """
+    definitions = schema.get("$defs") or {}
+
+    def resolve(node: Any) -> Any:
+        if isinstance(node, dict):
+            reference = node.get("$ref")
+            if isinstance(reference, str) and reference.startswith("#/$defs/"):
+                target = definitions.get(reference.rsplit("/", 1)[-1])
+                if target is not None:
+                    return resolve(target)
+            return {key: resolve(value) for key, value in node.items() if key != "$defs"}
+        if isinstance(node, list):
+            return [resolve(item) for item in node]
+        return node
+
+    return resolve(schema)
+
+
+def _rejects_json_schema(exc: Exception) -> bool:
+    """True when the provider refuses `response_format: json_schema`.
+
+    Only a 4xx that names the field counts. A timeout, a rate limit or a schema
+    mismatch must propagate — silently degrading those to JSON mode would hide the
+    real fault behind a lower-quality path.
+    """
+    status = getattr(exc, "status_code", None)
+    text = str(exc)
+    return status in {400, 422} and ("response_format" in text or "json_schema" in text)
+
+
+def _coerce(parsed: Any, schema: type) -> Any | None:
+    """Normalise a parsed payload to the pydantic model.
+
+    Binding a JSON-schema dict returns plain dicts, while binding the model returns
+    model instances; both have to end up as the latter.
+    """
+    if parsed is None:
+        return None
+    if isinstance(parsed, schema):
+        return parsed
+    if isinstance(parsed, BaseModel):
+        # A subclass schema (e.g. TableRequiredReport) rejects a base instance by
+        # identity, so round-trip through its fields instead.
+        try:
+            return schema.model_validate(parsed.model_dump())
+        except ValidationError:
+            return None
+    if isinstance(parsed, dict):
+        try:
+            return schema.model_validate(parsed)
+        except ValidationError:
+            return None
+    return None
+
+
+def _schema_hint(parameters: dict[str, Any]) -> SystemMessage:
+    return SystemMessage(
+        content=(
+            "输出要求：只输出一个 JSON 对象，必须严格符合下面的 JSON Schema。"
+            "不要输出解释文字，不要用 Markdown 代码块包裹，不要添加 schema 之外的字段。\n"
+            + json.dumps(parameters, ensure_ascii=False)
+        )
+    )
+
+
+def url_key(url: str) -> str:
+    """Normalise a URL so language variants of the same article collapse.
+
+    DeepSeek Search happily returns /cn/ and /tw/ copies of the same page; those
+    differ only by URL, so a naive URL comparison lets one article in twice and
+    makes a single source look like two independent ones during cross-validation.
+    """
+    parsed = urlparse(url.strip())
+    host = parsed.netloc.lower().removeprefix("www.")
+    path = _LANG_SEGMENT.sub("", parsed.path.rstrip("/"))
+    return f"{host}{path}"
+
+
+def confidence_from_authority(authority: int, rerank_score: float) -> float:
+    base = _AUTHORITY_BASE.get(authority, 0.45)
+    if rerank_score >= 2.5:
+        base += 0.10
+    elif rerank_score >= 1.5:
+        base += 0.05
+    return round(min(base, 1.0), 2)
+
+
+def clean_url(url: str) -> str:
+    """Drop fragments and query params; Search appends anchors like `#1`."""
+    parsed = urlparse(url.strip())
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
+
+
+def clean_title(title: str) -> str:
+    """Collapse `Headline - Headline` titles that some news sites return."""
+    head, separator, tail = title.strip().partition(" - ")
+    if separator and head and tail.strip().startswith(head[:15]):
+        return head.strip()
+    return title.strip()
+
+
+def dedupe_sources(sources: Sequence[Source] | None) -> list[Source]:
+    """Keep the first occurrence of each page, preserving collection order."""
+    seen: set[str] = set()
+    unique: list[Source] = []
+    for source in sources or []:
+        key = url_key(source.url)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        unique.append(source)
+    return unique
+
+
+def excerpt(text: str, limit: int = EXCERPT_CHARS) -> str:
+    """Cut an excerpt and say so.
+
+    A silent cut teaches the model that whatever it cannot see does not exist,
+    which corrupts the "information gap" section it is asked to write. The marker
+    is therefore part of the contract, not decoration.
+    """
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}…（节选，全文共 {len(text)} 字，此处为前 {limit} 字）"
+
+
+def numbered_sources(sources: Sequence[Source], include_excerpt: bool = True) -> str:
+    blocks = []
+    for index, source in enumerate(sources, start=1):
+        lines = [
+            f"[{index}] {source.title or source.url}",
+            f"    URL: {source.url}",
+            f"    站点: {source.site_name or '未知'} | 发布: {source.published_at or '未知'}",
+            f"    可信度: {source.confidence:.2f}"
+            f"（authority {source.authority}, rerank {source.rerank_score:.2f}）",
+        ]
+        # Skipping the line entirely, rather than printing a placeholder, keeps 12
+        # sources from spending tokens on "excerpt omitted" twelve times.
+        if include_excerpt:
+            body = excerpt(source.content or source.summary or source.snippet)
+            lines.append(f"    摘录: {body}")
+        blocks.append("\n".join(lines))
+    return "\n".join(blocks)
+
+
+def source_appendix(sources: Sequence[Source]) -> str:
+    if not sources:
+        return ""
+    lines = ["", "---", "", "### 参考来源", ""]
+    for index, source in enumerate(sources, start=1):
+        title = source.title or source.url
+        published = f"，{source.published_at[:10]}" if source.published_at else ""
+        lines.append(
+            f"[{index}] [{title}]({source.url}) — 可信度 {source.confidence:.2f}"
+            f"（{source.site_name or '未知来源'}{published}）"
+        )
+    return "\n".join(lines)
+
+
+def clamp_anchors(text: str, source_count: int) -> str:
+    """Drop citation anchors that do not resolve to a recorded source."""
+
+    def replace(match: re.Match[str]) -> str:
+        index = int(match.group(1))
+        return match.group(0) if 1 <= index <= source_count else ""
+
+    return re.sub(r"\[(\d+)\]", replace, text)

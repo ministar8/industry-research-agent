@@ -1,0 +1,8 @@
+{
+    "python_version": "3.12",
+    "dependencies": ["./src"],
+    "graphs": {
+        "research_supervisor": "./src/agents/research_team/graph.py:research_supervisor"
+    },
+    "env": "./.env"
+}
