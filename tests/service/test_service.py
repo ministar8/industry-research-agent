@@ -1,4 +1,5 @@
 import json
+import logging
 from unittest.mock import AsyncMock, patch
 
 import langsmith
@@ -231,6 +232,33 @@ def test_feedback(mock_client: langsmith.Client, test_client) -> None:
         key="human-feedback-stars",
         score=0.8,
     )
+
+
+@patch("service.service.LangsmithClient")
+def test_feedback_create_error_returns_structured_500(mock_client, test_client) -> None:
+    """A LangSmith call failure is a structured 500, not a raw traceback."""
+    mock_client.return_value.create_feedback.side_effect = RuntimeError("langsmith down")
+    body = {
+        "run_id": "847c6285-8fc9-4560-a83f-4e6285809254",
+        "key": "human-feedback-stars",
+        "score": 0.8,
+    }
+    response = test_client.post("/feedback", json=body)
+    assert response.status_code == 500
+    assert response.json() == {"detail": "Unexpected error"}
+
+
+@patch("service.service.LangsmithClient", side_effect=RuntimeError("no api key"))
+def test_feedback_client_init_error_returns_structured_500(mock_client, test_client) -> None:
+    """A missing LangSmith key fails at client construction; still a structured 500."""
+    body = {
+        "run_id": "847c6285-8fc9-4560-a83f-4e6285809254",
+        "key": "human-feedback-stars",
+        "score": 0.8,
+    }
+    response = test_client.post("/feedback", json=body)
+    assert response.status_code == 500
+    assert response.json() == {"detail": "Unexpected error"}
 
 
 def test_history(test_client, mock_agent) -> None:
@@ -503,3 +531,40 @@ def test_unknown_agent_returns_404(test_client, endpoint) -> None:
 
     assert response.status_code == 404
     assert "not found" in response.json()["detail"]
+
+
+def test_invoke_metrics_use_generated_thread_id(test_client, mock_agent, caplog) -> None:
+    """When the client omits thread_id, the metrics line records the generated one, not '-'."""
+    caplog.set_level(logging.INFO, logger="core.metrics")
+    mock_agent.ainvoke.return_value = [("values", {"messages": [AIMessage(content="ok")]})]
+
+    response = test_client.post("/invoke", json={"message": "hi"})
+    assert response.status_code == 200
+
+    resolved = mock_agent.ainvoke.await_args.kwargs["config"]["configurable"]["thread_id"]
+    lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("turn thread=")]
+    assert len(lines) == 1
+    assert f"thread={resolved}" in lines[0]
+    assert "thread=-" not in lines[0]
+
+
+@pytest.mark.asyncio
+async def test_stream_metrics_use_generated_thread_id(test_client, mock_agent, caplog) -> None:
+    """The /stream path correlates metrics to the generated thread_id too."""
+    caplog.set_level(logging.INFO, logger="core.metrics")
+
+    async def mock_astream(**kwargs):
+        yield ("updates", {"chat_model": {"messages": [AIMessage(content="ok")]}})
+
+    mock_agent.astream = mock_astream
+
+    with test_client.stream("POST", "/stream", json={"message": "hi"}) as response:
+        assert response.status_code == 200
+        for _ in response.iter_lines():
+            pass
+
+    resolved = mock_agent.aget_state.await_args.kwargs["config"]["configurable"]["thread_id"]
+    lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("turn thread=")]
+    assert len(lines) == 1
+    assert f"thread={resolved}" in lines[0]
+    assert "thread=-" not in lines[0]

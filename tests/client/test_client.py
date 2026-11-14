@@ -15,7 +15,7 @@ def test_init(mock_env):
     """Test client initialization with different parameters."""
     # Test default values
     client = AgentClient(get_info=False)
-    assert client.base_url == "http://0.0.0.0"
+    assert client.base_url == "http://127.0.0.1:8080"
     assert client.timeout is None
 
     # Test custom values
@@ -236,6 +236,16 @@ async def test_astream(agent_client):
             async for _ in agent_client.astream(QUESTION):
                 pass
         assert "500 Internal Server Error" in str(exc.value)
+
+
+def test_parse_stream_line_raises_client_error(agent_client):
+    """Malformed frames raise AgentClientError so the caller's error handling catches them."""
+    with pytest.raises(AgentClientError, match="JSON parsing"):
+        agent_client._parse_stream_line("data: {not valid json")
+    with pytest.raises(AgentClientError, match="invalid message"):
+        agent_client._parse_stream_line(
+            "data: " + json.dumps({"type": "message", "content": {"type": "ai"}})
+        )
 
 
 @pytest.mark.asyncio

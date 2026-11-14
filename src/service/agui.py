@@ -22,6 +22,7 @@ from fastapi.responses import StreamingResponse
 from langchain_core.runnables import RunnableConfig
 
 from agents import DEFAULT_AGENT, AgentGraph, get_agent
+from core.metrics import begin_turn, end_turn
 from service.utils import ensure_model_available
 
 logger = logging.getLogger(__name__)
@@ -71,17 +72,35 @@ async def _event_stream(
     config: RunnableConfig,
     encoder: EventEncoder,
 ) -> AsyncGenerator[str, None]:
-    # A new LangGraphAgent per request: it holds per-run state and is cheap to build.
-    agent = LangGraphAgent(name=agent_id, graph=graph, config=config)  # type: ignore[arg-type]
-    async for event in agent.run(input_data):
-        # Don't forward RAW passthrough events. Standard AG-UI clients ignore them,
-        # and they expose server-side internals - including fully rendered prompts
-        # from on_chat_model_start - to the caller. Remove this filter only if the
-        # endpoint is consumed by a trusted middle layer and you want the full
-        # event firehose (e.g. for the AG-UI Event Inspector).
-        if event.type == EventType.RAW:
-            continue
-        yield encoder.encode(event)
+    # Open the same per-turn collector the vanilla /stream path uses, so AG-UI runs
+    # report cost/degradation/failure instead of vanishing from the metrics line.
+    turn = begin_turn(input_data.thread_id)
+    # "closed" means the consumer went away before the run finished.
+    outcome = "closed"
+    try:
+        # A new LangGraphAgent per request: it holds per-run state and is cheap to build.
+        agent = LangGraphAgent(name=agent_id, graph=graph, config=config)  # type: ignore[arg-type]
+        async for event in agent.run(input_data):
+            # Don't forward RAW passthrough events. Standard AG-UI clients ignore them,
+            # and they expose server-side internals - including fully rendered prompts
+            # from on_chat_model_start - to the caller. Remove this filter only if the
+            # endpoint is consumed by a trusted middle layer and you want the full
+            # event firehose (e.g. for the AG-UI Event Inspector).
+            if event.type == EventType.RAW:
+                continue
+            # The package turns graph exceptions into RUN_ERROR events rather than
+            # raising, so error status must be read off the stream, not a try/except.
+            if event.type == EventType.RUN_ERROR:
+                outcome = "error"
+            yield encoder.encode(event)
+        if outcome == "closed":
+            outcome = "ok"
+    except Exception:
+        outcome = "error"
+        logger.exception("AG-UI run failed")
+        raise
+    finally:
+        end_turn(turn, outcome)
 
 
 @router.post("/run", operation_id="agui_run_default")

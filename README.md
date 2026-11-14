@@ -133,7 +133,6 @@ src/
 │   │   └── graph.py          # 图组装
 │   ├── agents.py             # agent 注册表
 │   ├── lazy_agent.py         # 需要异步初始化的 agent 基类（当前注册的 agent 未使用）
-│   ├── safeguard.py          # 可选的提示注入检测
 │   ├── tools.py              # 共享工具
 │   └── utils.py              # 消息与回调辅助
 ├── core/                     # settings.py、llm.py（模型工厂）、metrics.py（请求级计数）

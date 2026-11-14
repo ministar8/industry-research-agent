@@ -1,9 +1,12 @@
 import json
+import logging
 from typing import Any
 from unittest.mock import patch
 
 import pytest
+from ag_ui.core import RunAgentInput
 from ag_ui.core.events import Event
+from ag_ui.encoder import EventEncoder
 from langchain_core.language_models.fake_chat_models import FakeListChatModel
 from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableConfig
@@ -12,8 +15,9 @@ from langgraph.graph import END, MessagesState, StateGraph
 from langgraph.types import interrupt
 from pydantic import TypeAdapter
 
-from core import settings
+from core import metrics, settings
 from schema.models import FakeModelName
+from service.agui import _event_stream
 
 FAKE_RESPONSE = "The answer is 42"
 
@@ -49,6 +53,34 @@ interrupt_graph.add_edge("ask", END)
 interrupt_agent = interrupt_graph.compile(checkpointer=MemorySaver())
 
 
+async def record_then_reply(state: MessagesState, config: RunnableConfig) -> MessagesState:
+    # Writes into the per-turn collector the way real nodes do. If the contextvar
+    # opened in _event_stream did not propagate through ag-ui-langgraph, these counts
+    # would stay zero and the metrics test would fail.
+    metrics.record_usage({"input_tokens": 100, "output_tokens": 20}, label="stub")
+    metrics.record_search(ok=True)
+    return {"messages": [AIMessage(content="recorded")]}
+
+
+metrics_graph = StateGraph(MessagesState)
+metrics_graph.add_node("record", record_then_reply)
+metrics_graph.set_entry_point("record")
+metrics_graph.add_edge("record", END)
+metrics_agent = metrics_graph.compile(checkpointer=MemorySaver())
+
+
+async def record_then_fail(state: MessagesState, config: RunnableConfig) -> MessagesState:
+    metrics.record_usage({"input_tokens": 5, "output_tokens": 0}, label="stub")
+    raise RuntimeError("boom")
+
+
+failing_graph = StateGraph(MessagesState)
+failing_graph.add_node("fail", record_then_fail)
+failing_graph.set_entry_point("fail")
+failing_graph.add_edge("fail", END)
+failing_agent = failing_graph.compile(checkpointer=MemorySaver())
+
+
 @pytest.fixture(autouse=True)
 def _reset_captured_configurable():
     """Every test using model_agent writes to this shared dict; reset before each test."""
@@ -65,7 +97,12 @@ def allow_fake_model(monkeypatch):
 @pytest.fixture
 def mock_agui_agent():
     def agent_lookup(agent_id: str):
-        agents = {"model-agent": model_agent, "interrupt-agent": interrupt_agent}
+        agents = {
+            "model-agent": model_agent,
+            "interrupt-agent": interrupt_agent,
+            "metrics-agent": metrics_agent,
+            "failing-agent": failing_agent,
+        }
         try:
             return agents[agent_id]
         except KeyError:
@@ -248,3 +285,59 @@ def test_agui_auth(mock_settings, mock_agui_agent, test_client) -> None:
         headers={"Authorization": "Bearer test-secret"},
     )
     assert response.status_code == 200
+
+
+def _turn_lines(caplog) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.getMessage().startswith("turn thread=")]
+
+
+def test_agui_emits_turn_metrics(mock_agui_agent, test_client, caplog) -> None:
+    """AG-UI runs open the per-turn collector and node counts reach it.
+
+    A zero count would mean the contextvar did not propagate through ag-ui-langgraph
+    and the metrics line is silently empty - the exact failure this guards against.
+    """
+    caplog.set_level(logging.INFO, logger="core.metrics")
+    events = collect_events(
+        test_client, "/agui/metrics-agent/run", run_input(thread_id="metrics-thread")
+    )
+    assert events[-1]["type"] == "RUN_FINISHED"
+
+    lines = _turn_lines(caplog)
+    assert len(lines) == 1
+    assert "thread=metrics-thread" in lines[0]
+    assert "status=ok" in lines[0]
+    assert "llm_calls=1" in lines[0]
+    assert "tokens_in=100" in lines[0]
+    assert "search=1" in lines[0]
+
+
+def test_agui_metrics_status_error_on_run_error(mock_agui_agent, test_client, caplog) -> None:
+    """A graph failure surfaces as RUN_ERROR and the turn line reports status=error."""
+    caplog.set_level(logging.INFO, logger="core.metrics")
+    events = collect_events(
+        test_client, "/agui/failing-agent/run", run_input(thread_id="error-thread")
+    )
+    assert any(e["type"] == "RUN_ERROR" for e in events)
+
+    lines = _turn_lines(caplog)
+    assert len(lines) == 1
+    assert "status=error" in lines[0]
+    assert "llm_calls=1" in lines[0]
+
+
+@pytest.mark.asyncio
+async def test_agui_metrics_closed_on_early_disconnect(caplog) -> None:
+    """Closing the stream before the run finishes records status=closed, not ok."""
+    caplog.set_level(logging.INFO, logger="core.metrics")
+    input_data = RunAgentInput.model_validate(run_input(thread_id="closed-thread"))
+    config = RunnableConfig(configurable={"thread_id": "closed-thread", "user_id": "u"})
+    encoder = EventEncoder(accept="text/event-stream")
+    gen = _event_stream("metrics-agent", metrics_agent, input_data, config, encoder)
+    await gen.__anext__()
+    await gen.aclose()
+
+    lines = _turn_lines(caplog)
+    assert len(lines) == 1
+    assert "thread=closed-thread" in lines[0]
+    assert "status=closed" in lines[0]

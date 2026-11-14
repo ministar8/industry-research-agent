@@ -27,7 +27,7 @@ class AgentClient:
 
     def __init__(
         self,
-        base_url: str = "http://0.0.0.0",
+        base_url: str = "http://127.0.0.1:8080",
         agent: str | None = None,
         timeout: float | None = None,
         get_info: bool = True,
@@ -185,14 +185,14 @@ class AgentClient:
             try:
                 parsed = json.loads(data)
             except Exception as e:
-                raise Exception(f"Error JSON parsing message from server: {e}")
+                raise AgentClientError(f"Error JSON parsing message from server: {e}")
             match parsed["type"]:
                 case "message":
                     # Convert the JSON formatted message to an AnyMessage
                     try:
                         return ChatMessage.model_validate(parsed["content"])
                     except Exception as e:
-                        raise Exception(f"Server returned invalid message: {e}")
+                        raise AgentClientError(f"Server returned invalid message: {e}")
                 case "token":
                     # Yield the str token directly
                     return parsed["content"]
@@ -254,7 +254,9 @@ class AgentClient:
                         parsed = self._parse_stream_line(line)
                         if parsed is None:
                             break
-                        yield parsed
+                        # Don't yield empty string tokens as they cause generator issues
+                        if parsed != "":
+                            yield parsed
         except httpx.HTTPError as e:
             raise AgentClientError(f"Error: {e}")
 
@@ -319,7 +321,7 @@ class AgentClient:
                 raise AgentClientError(f"Error: {e}")
 
     async def acreate_feedback(
-        self, run_id: str, key: str, score: float, kwargs: dict[str, Any] = {}
+        self, run_id: str, key: str, score: float, kwargs: dict[str, Any] | None = None
     ) -> None:
         """
         Create a feedback record for a run.
@@ -328,7 +330,7 @@ class AgentClient:
         credentials can be stored and managed in the service rather than the client.
         See: https://api.smith.langchain.com/redoc#tag/feedback/operation/create_feedback_api_v1_feedback_post
         """
-        request = Feedback(run_id=run_id, key=key, score=score, kwargs=kwargs)
+        request = Feedback(run_id=run_id, key=key, score=score, kwargs=kwargs or {})
         async with httpx.AsyncClient() as client:
             try:
                 response = await client.post(

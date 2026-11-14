@@ -142,10 +142,10 @@ def _get_agent_or_404(agent_id: str) -> AgentGraph:
 
 async def _handle_input(
     user_input: UserInput, agent: AgentGraph, agent_id: str
-) -> tuple[dict[str, Any], UUID]:
+) -> tuple[dict[str, Any], UUID, str]:
     """
     Parse user input and handle any required interrupt resumption.
-    Returns kwargs for agent invocation and the run_id.
+    Returns kwargs for agent invocation, the run_id, and the resolved thread_id.
     """
     run_id = uuid7()
     thread_id = user_input.thread_id or str(uuid4())
@@ -186,7 +186,7 @@ async def _handle_input(
         "config": config,
     }
 
-    return kwargs, run_id
+    return kwargs, run_id, thread_id
 
 
 @router.post("/{agent_id}/invoke", operation_id="invoke_with_agent_id")
@@ -206,9 +206,9 @@ async def invoke(user_input: UserInput, agent_id: str = DEFAULT_AGENT) -> ChatMe
     # you'd want to include it. You could update the API to return a list of ChatMessages
     # in that case.
     agent: AgentGraph = _get_agent_or_404(agent_id)
-    kwargs, run_id = await _handle_input(user_input, agent, agent_id)
+    kwargs, run_id, thread_id = await _handle_input(user_input, agent, agent_id)
 
-    turn = begin_turn(user_input.thread_id)
+    turn = begin_turn(thread_id)
     outcome = "error"
     try:
         response_events: list[tuple[str, Any]] = await agent.ainvoke(**kwargs, stream_mode=["updates", "values"])  # type: ignore # fmt: skip
@@ -245,9 +245,9 @@ async def message_generator(
     This is the workhorse method for the /stream endpoint. The agent is resolved by
     the caller so an unknown agent_id fails with 404 before SSE headers are sent.
     """
-    kwargs, run_id = await _handle_input(user_input, agent, agent_id)
+    kwargs, run_id, thread_id = await _handle_input(user_input, agent, agent_id)
 
-    turn = begin_turn(user_input.thread_id)
+    turn = begin_turn(thread_id)
     # "closed" means the consumer went away before the graph finished.
     outcome = "closed"
     try:
@@ -413,14 +413,18 @@ async def feedback(feedback: Feedback) -> FeedbackResponse:
     credentials can be stored and managed in the service rather than the client.
     See: https://api.smith.langchain.com/redoc#tag/feedback/operation/create_feedback_api_v1_feedback_post
     """
-    client = LangsmithClient()
-    kwargs = feedback.kwargs or {}
-    client.create_feedback(
-        run_id=feedback.run_id,
-        key=feedback.key,
-        score=feedback.score,
-        **kwargs,
-    )
+    try:
+        client = LangsmithClient()
+        kwargs = feedback.kwargs or {}
+        client.create_feedback(
+            run_id=feedback.run_id,
+            key=feedback.key,
+            score=feedback.score,
+            **kwargs,
+        )
+    except Exception as e:
+        logger.error(f"An exception occurred: {e}")
+        raise HTTPException(status_code=500, detail="Unexpected error")
     return FeedbackResponse()
 
 
