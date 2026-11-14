@@ -13,7 +13,8 @@ def test_service_with_fake_model():
     client = AgentClient("http://0.0.0.0", agent="research-supervisor")
     response = client.invoke("Tell me a joke?", model="fake")
     assert response.type == "ai"
-    assert response.content == "This is a test response from the fake model."
+    # research-supervisor parses intent; off-topic input hits the no-target hint, not an echo.
+    assert response.content.startswith("没能从这段输入里识别出可调研的对象")
 
 
 @pytest.mark.docker
@@ -25,7 +26,7 @@ def test_service_with_app():
     at = AppTest.from_file("../../src/streamlit_app.py").run()
     assert at.chat_message[0].avatar == "assistant"
     welcome = at.chat_message[0].markdown[0].value
-    assert welcome.startswith("Hello! I'm an AI-powered research assistant")
+    assert welcome.startswith("我是行业与竞品调研助手")
     assert not at.exception
 
     at.sidebar.selectbox[1].set_value("research-supervisor")
@@ -33,5 +34,5 @@ def test_service_with_app():
     assert at.chat_message[0].avatar == "user"
     assert at.chat_message[0].markdown[0].value == "What is the weather in Tokyo?"
     assert at.chat_message[1].avatar == "assistant"
-    assert at.chat_message[1].markdown[0].value == "This is a test response from the fake model."
+    assert at.chat_message[1].markdown[0].value.startswith("没能从这段输入里识别出可调研的对象")
     assert not at.exception
