@@ -32,6 +32,7 @@ class TurnMetrics:
     fetch_calls: int = 0
     search_failed: int = 0
     fetch_failed: int = 0
+    fetch_skipped: int = 0
     degradations: list[str] = field(default_factory=list)
     # Per-node attribution: {"judge": {"calls": 1, "in": 9000, "out": 600}, ...}
     calls: dict[str, dict[str, int]] = field(default_factory=dict)
@@ -50,11 +51,14 @@ class TurnMetrics:
         bucket["out"] += output_tokens
 
     def emit(self, status: str) -> None:
+        # `thread_id` comes from the request. A newline in it would split this line in
+        # two and let the caller forge an entry that looks legitimate to log parsers.
+        thread = str(self.thread_id).replace("\r", "\\r").replace("\n", "\\n")
         logger.info(
             "turn thread=%s status=%s elapsed=%.1fs llm_calls=%d tokens_in=%d "
             "tokens_out=%d reasoning=%d search=%d fetch=%d search_failed=%d "
-            "fetch_failed=%d degraded=%s",
-            self.thread_id,
+            "fetch_failed=%d fetch_skipped=%d degraded=%s",
+            thread,
             status,
             perf_counter() - self.started_at,
             self.llm_calls,
@@ -65,6 +69,7 @@ class TurnMetrics:
             self.fetch_calls,
             self.search_failed,
             self.fetch_failed,
+            self.fetch_skipped,
             ",".join(self.degradations) or "-",
         )
         if logger.isEnabledFor(logging.DEBUG):
@@ -122,6 +127,17 @@ def record_fetch(ok: bool) -> None:
         metrics.fetch_calls += 1
     else:
         metrics.fetch_failed += 1
+
+
+def record_fetch_skipped() -> None:
+    """Count a deep-read target dropped before any HTTP call (unfetchable URL).
+
+    Distinct from fetch_failed: no request was made, so it must not inflate the
+    failure rate or imply a billed call.
+    """
+    metrics = _current.get()
+    if metrics is not None:
+        metrics.fetch_skipped += 1
 
 
 def record_degradation(reason: str) -> None:

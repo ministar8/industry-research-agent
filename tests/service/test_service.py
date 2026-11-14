@@ -161,6 +161,38 @@ def test_invoke_custom_agent_config(test_client, mock_agent) -> None:
     assert response.status_code == 422
 
 
+@pytest.mark.parametrize(
+    "endpoint", ["/invoke", "/stream", "/custom_agent/invoke", "/custom_agent/stream"]
+)
+@pytest.mark.parametrize("key", ["thread_id", "user_id", "model", "checkpoint_id", "checkpoint_ns"])
+@pytest.mark.parametrize("value", ["override", "", None])
+def test_agent_config_rejects_reserved_keys(test_client, mock_agent, endpoint, key, value) -> None:
+    response = test_client.post(
+        endpoint,
+        json={"message": "Continue research", "agent_config": {key: value}},
+    )
+
+    assert response.status_code == 422
+    assert "reserved keys" in response.text
+    assert key in response.text
+    mock_agent.aget_state.assert_not_awaited()
+    mock_agent.ainvoke.assert_not_awaited()
+    mock_agent.astream.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "endpoint", ["/invoke", "/stream", "/custom_agent/invoke", "/custom_agent/stream"]
+)
+def test_message_rejects_longer_value(test_client, mock_agent, endpoint) -> None:
+    response = test_client.post(endpoint, json={"message": "x" * 20_001})
+
+    assert response.status_code == 422
+    assert "at most 20000 characters" in response.text
+    mock_agent.aget_state.assert_not_awaited()
+    mock_agent.ainvoke.assert_not_awaited()
+    mock_agent.astream.assert_not_called()
+
+
 def test_invoke_interrupt(test_client, mock_agent) -> None:
     QUESTION = "What is the weather in Tokyo?"
     ANSWER = "The weather in Tokyo is 70 degrees."
@@ -319,9 +351,17 @@ async def test_stream(test_client, mock_agent) -> None:
 
     # Make request with streaming
     with test_client.stream(
-        "POST", "/stream", json={"message": QUESTION, "stream_tokens": True}
+        "POST",
+        "/stream",
+        json={
+            "message": QUESTION,
+            "stream_tokens": True,
+            "agent_config": {"spicy_level": 0.8},
+        },
     ) as response:
         assert response.status_code == 200
+        config = mock_agent.aget_state.await_args.kwargs["config"]
+        assert config["configurable"]["spicy_level"] == 0.8
 
         # Collect all SSE messages
         messages = []
@@ -449,3 +489,17 @@ def test_info(test_client, mock_settings) -> None:
 
     assert output.default_model == OpenAIModelName.GPT_6_LUNA
     assert output.models == [OpenAIModelName.GPT_6_LUNA, OpenAIModelName.GPT_61_TERRA]
+
+
+@pytest.mark.parametrize("endpoint", ["/invoke", "/stream", "/history", "/threads"])
+def test_unknown_agent_returns_404(test_client, endpoint) -> None:
+    """Vanilla endpoints must match AG-UI: unknown agent_id is 404, not 500."""
+    if endpoint == "/threads":
+        response = test_client.get("/no-such-agent/threads", params={"user_id": "u"})
+    elif endpoint == "/history":
+        response = test_client.post("/no-such-agent/history", json={"thread_id": "t"})
+    else:
+        response = test_client.post(f"/no-such-agent{endpoint}", json={"message": "x"})
+
+    assert response.status_code == 404
+    assert "not found" in response.json()["detail"]

@@ -118,10 +118,21 @@ def test_app_resume_with_agent_param(mock_agent_client):
     assert not at.exception
 
 
-def test_app_feedback(mock_agent_client):
-    """TODO: Can't figure out how to interact with st.feedback"""
+def test_app_feedback_skipped_for_history_without_run_id(mock_agent_client):
+    """Replayed history has no run_id; drawing the stars widget there let a click
+    send Feedback(run_id=None) and crash. No widget should be drawn at all."""
 
-    pass
+    at = AppTest.from_file("../../src/streamlit_app.py")
+    at.query_params["thread_id"] = "1234"
+    HISTORY = [
+        ChatMessage(type="human", content="What is the weather?"),
+        ChatMessage(type="ai", content="The weather is sunny."),
+    ]
+    mock_agent_client.get_history.return_value = ChatHistory(messages=HISTORY)
+    at.run()
+
+    assert not at.exception
+    assert len(at.get("feedback")) == 0
 
 
 @pytest.mark.asyncio
@@ -309,9 +320,12 @@ def multi_agent_messages():
         tool_call_id="back-c-super",
     )
 
-    # Final response
+    # Final response. Live streams carry a run_id, which is what enables the
+    # feedback widget; replayed history does not.
     supervisor_final = ChatMessage(
-        type="ai", content="All agents have completed their tasks successfully."
+        type="ai",
+        content="All agents have completed their tasks successfully.",
+        run_id="test-run-id",
     )
 
     return {

@@ -133,6 +133,13 @@ async def info() -> ServiceMetadata:
     )
 
 
+def _get_agent_or_404(agent_id: str) -> AgentGraph:
+    try:
+        return get_agent(agent_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"Agent {agent_id} not found")
+
+
 async def _handle_input(
     user_input: UserInput, agent: AgentGraph, agent_id: str
 ) -> tuple[dict[str, Any], UUID]:
@@ -151,15 +158,7 @@ async def _handle_input(
 
     callbacks: list[Any] = []
 
-    if user_input.agent_config:
-        # Check for reserved keys (including 'model' even if not in configurable)
-        reserved_keys = {"thread_id", "user_id", "model"}
-        if overlap := reserved_keys & user_input.agent_config.keys():
-            raise HTTPException(
-                status_code=422,
-                detail=f"agent_config contains reserved keys: {overlap}",
-            )
-        configurable.update(user_input.agent_config)
+    configurable.update(user_input.agent_config)
 
     config = RunnableConfig(
         configurable=configurable,
@@ -206,7 +205,7 @@ async def invoke(user_input: UserInput, agent_id: str = DEFAULT_AGENT) -> ChatMe
     # in interrupt-agent, or a tool step in research-assistant), it's omitted. Arguably,
     # you'd want to include it. You could update the API to return a list of ChatMessages
     # in that case.
-    agent: AgentGraph = get_agent(agent_id)
+    agent: AgentGraph = _get_agent_or_404(agent_id)
     kwargs, run_id = await _handle_input(user_input, agent, agent_id)
 
     turn = begin_turn(user_input.thread_id)
@@ -238,14 +237,14 @@ async def invoke(user_input: UserInput, agent_id: str = DEFAULT_AGENT) -> ChatMe
 
 
 async def message_generator(
-    user_input: StreamInput, agent_id: str = DEFAULT_AGENT
+    user_input: StreamInput, agent: AgentGraph, agent_id: str = DEFAULT_AGENT
 ) -> AsyncGenerator[str, None]:
     """
     Generate a stream of messages from the agent.
 
-    This is the workhorse method for the /stream endpoint.
+    This is the workhorse method for the /stream endpoint. The agent is resolved by
+    the caller so an unknown agent_id fails with 404 before SSE headers are sent.
     """
-    agent: AgentGraph = get_agent(agent_id)
     kwargs, run_id = await _handle_input(user_input, agent, agent_id)
 
     turn = begin_turn(user_input.thread_id)
@@ -398,8 +397,9 @@ async def stream(user_input: StreamInput, agent_id: str = DEFAULT_AGENT) -> Stre
 
     Set `stream_tokens=false` to return intermediate messages but not token-by-token.
     """
+    agent = _get_agent_or_404(agent_id)
     return StreamingResponse(
-        message_generator(user_input, agent_id),
+        message_generator(user_input, agent, agent_id),
         media_type="text/event-stream",
     )
 
@@ -432,7 +432,7 @@ async def history(input: ChatHistoryInput, agent_id: str = DEFAULT_AGENT) -> Cha
 
     If agent_id is not provided, the default agent will be used.
     """
-    agent: AgentGraph = get_agent(agent_id)
+    agent: AgentGraph = _get_agent_or_404(agent_id)
     config = RunnableConfig(configurable={"thread_id": input.thread_id})
     try:
         messages: list[BaseMessage] = []
@@ -466,7 +466,7 @@ async def threads(
     trust model as /history. Put your own authorization in front of this before end
     users can reach it.
     """
-    agent: AgentGraph = get_agent(agent_id)
+    agent: AgentGraph = _get_agent_or_404(agent_id)
     checkpointer = getattr(agent, "checkpointer", None)
     if not checkpointer:
         return UserThreads(threads=[])

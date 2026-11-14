@@ -161,8 +161,15 @@ async def supervisor(state: ResearchState, config: RunnableConfig) -> dict[str, 
         if state.get("report"):
             update["report"] = ""
 
-    if decision.constraints:
-        update["constraints"] = decision.constraints
+    # A later round re-parses the same input and may under-report constraints; merging
+    # within a turn keeps the verbatim set intact. A new turn starts fresh so the
+    # previous turn's scope does not leak into an unrelated request.
+    if is_new_turn:
+        update["constraints"] = list(dict.fromkeys(decision.constraints))
+    else:
+        merged = list(state.get("constraints") or [])
+        merged += [c for c in decision.constraints if c not in merged]
+        update["constraints"] = merged
 
     return update
 

@@ -12,6 +12,7 @@ from agents.research_team.analyst import AnalysisBundle, analyst
 from agents.research_team.helpers import (
     EXCERPT_CHARS,
     clamp_anchors,
+    clean_url,
     confidence_from_authority,
     dedupe_sources,
     excerpt,
@@ -47,6 +48,7 @@ from agents.research_team.writer import (
     requires_table,
     writer,
 )
+from core.metrics import begin_turn, current, end_turn
 
 
 def make_source(url: str, confidence: float = 0.8) -> Source:
@@ -65,6 +67,19 @@ def test_dedupe_sources_keeps_first_occurrence():
 
 def test_dedupe_sources_handles_none():
     assert dedupe_sources(None) == []
+
+
+def test_dedupe_upgrades_first_copy_with_later_deep_read():
+    shallow = Source(url="https://x.example/a", title="X", summary="短摘要", content="")
+    deep = Source(
+        url="https://x.example/a", title="X", summary="短摘要", content="Fetch 抓到的正文"
+    )
+    kept = dedupe_sources([shallow, deep])
+
+    assert len(kept) == 1
+    assert kept[0].content == "Fetch 抓到的正文"
+    # The state-held originals must not be mutated by a read-path dedupe.
+    assert shallow.content == ""
 
 
 def test_clamp_anchors_drops_unknown_indices():
@@ -379,6 +394,55 @@ async def test_supervisor_clears_stale_report_on_reanalysis():
     assert update["report"] == ""
 
 
+@pytest.mark.asyncio
+async def test_supervisor_merges_constraints_within_a_turn():
+    decision = RoutingDecision(
+        intent="继续调研",
+        is_research=True,
+        sub_questions=[],
+        constraints=["地区：中国"],
+        next="analyst",
+        reason="来源已足够",
+    )
+    state = {
+        "messages": [HumanMessage(content="调研"), AIMessage(content="检索完成")],
+        "constraints": ["时间范围：2025 年", "用表格呈现"],
+        "sources": [make_source("https://a.example/1")],
+        "rounds": 2,
+    }
+    with (
+        patch("agents.research_team.supervisor.settings.USE_FAKE_MODEL", False),
+        patch("agents.research_team.supervisor.resolve_model", return_value=_StubModel(decision)),
+    ):
+        update = await supervisor(state, None)  # type: ignore[arg-type]
+
+    assert update["constraints"] == ["时间范围：2025 年", "用表格呈现", "地区：中国"]
+
+
+@pytest.mark.asyncio
+async def test_supervisor_resets_constraints_on_a_new_turn():
+    decision = RoutingDecision(
+        intent="新话题",
+        is_research=True,
+        sub_questions=["欧洲产能"],
+        constraints=["地区：欧洲"],
+        next="researcher",
+        reason="需要外部数据",
+    )
+    state = {
+        "messages": [HumanMessage(content="换个话题")],
+        "constraints": ["时间范围：2025 年"],
+        "rounds": 0,
+    }
+    with (
+        patch("agents.research_team.supervisor.settings.USE_FAKE_MODEL", False),
+        patch("agents.research_team.supervisor.resolve_model", return_value=_StubModel(decision)),
+    ):
+        update = await supervisor(state, None)  # type: ignore[arg-type]
+
+    assert update["constraints"] == ["地区：欧洲"]
+
+
 def test_url_key_collapses_language_variants():
     simplified = "https://www.infolink-group.com/cn/energy-2025"
     traditional = "https://infolink-group.com/tw/energy-2025"
@@ -391,6 +455,30 @@ def test_dedupe_sources_merges_language_variants():
         Source(url="https://x.example/tw/post", title="繁體版"),
     ]
     assert [s.title for s in dedupe_sources(sources)] == ["简体版"]
+
+
+def test_clean_url_keeps_identity_query_but_drops_tracking():
+    assert clean_url("https://x.example/a?id=1&utm_source=weibo#frag") == "https://x.example/a?id=1"
+    # Parameter order must not create a second key for the same article.
+    assert url_key(clean_url("https://x.example/a?b=2&a=1")) == url_key(
+        clean_url("https://x.example/a?a=1&b=2")
+    )
+
+
+def test_dedupe_keeps_distinct_query_id_articles():
+    sources = [
+        Source(url="https://x.example/d?id=1", title="文章一"),
+        Source(url="https://x.example/d?id=2", title="文章二"),
+    ]
+    assert [s.title for s in dedupe_sources(sources)] == ["文章一", "文章二"]
+
+
+def test_dedupe_merges_tracking_variants_of_one_query_id_article():
+    sources = [
+        Source(url="https://x.example/d?id=1&utm_source=weibo", title="微博转发"),
+        Source(url="https://x.example/d?id=1&utm_source=wechat", title="微信转发"),
+    ]
+    assert [s.title for s in dedupe_sources(sources)] == ["微博转发"]
 
 
 def test_confidence_from_authority():
@@ -422,9 +510,20 @@ async def test_search_clamps_payload_to_api_limits():
 
 @pytest.mark.asyncio
 async def test_fetch_rejects_unsafe_urls():
-    assert await fetch("ftp://example.com/x") is None
-    assert await fetch("https://user:pass@example.com/x") is None
-    assert await fetch("") is None
+    token = begin_turn("skip-probe")
+    try:
+        assert await fetch("ftp://example.com/x") is None
+        assert await fetch("https://user:pass@example.com/x") is None
+        assert await fetch("") is None
+        metrics = current()
+        assert metrics is not None
+        # Skips are counted separately: no HTTP call was made, so they must not
+        # inflate fetch (success) or fetch_failed.
+        assert metrics.fetch_skipped == 3
+        assert metrics.fetch_calls == 0
+        assert metrics.fetch_failed == 0
+    finally:
+        end_turn(token, "ok")
 
 
 @pytest.mark.asyncio
@@ -692,6 +791,17 @@ def test_requires_table_ignores_a_negated_request():
     assert requires_table(["交付格式：表格"]) is True
     assert requires_table(["交付格式：要点式，不用表格"]) is False
     assert requires_table(["时间范围：2025 年"]) is False
+
+
+def test_requires_table_scopes_negation_to_the_table_clause():
+    # An unrelated refusal in the same constraint must not cancel the table request.
+    assert requires_table(["请用表格呈现，不要分析动力电池业务"]) is True
+    assert requires_table(["用表格", "不要分析动力电池业务"]) is True
+    assert requires_table(["不要用任何表格"]) is False
+    # Negation after the table mention is not a refusal of tables.
+    assert requires_table(["表格不用太多"]) is True
+    # An explicit refusal wins over a positive request elsewhere.
+    assert requires_table(["用表格", "不用表格"]) is False
 
 
 def test_table_required_schema_forbids_an_empty_list():

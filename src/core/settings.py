@@ -168,10 +168,49 @@ class Settings(BaseSettings):
                 case _:
                     raise ValueError(f"Unknown provider: {provider}")
 
+        # A model name is only usable when its provider is configured. Without this
+        # check a mismatched DEFAULT_MODEL starts cleanly and then fails at the first
+        # request (500), or crashes the UI on `models.index(default_model)`.
+        # Fake mode short-circuits every node, so a leftover DEFAULT_MODEL from a real
+        # run must not block startup: the model is never called.
+        if (
+            not self.USE_FAKE_MODEL
+            and self.DEFAULT_MODEL is not None
+            and self.DEFAULT_MODEL not in self.AVAILABLE_MODELS
+        ):
+            required = {
+                DashScopeModelName: "DASHSCOPE_API_KEY",
+                DeepseekModelName: "DEEPSEEK_API_KEY",
+                OpenAIModelName: "OPENAI_API_KEY",
+                OpenAICompatibleName: "COMPATIBLE_BASE_URL and COMPATIBLE_MODEL",
+                FakeModelName: "USE_FAKE_MODEL=true",
+            }
+            missing = next(
+                (key for provider, key in required.items() if self.DEFAULT_MODEL in provider),
+                "a configured provider",
+            )
+            available = ", ".join(sorted(model.value for model in self.AVAILABLE_MODELS)) or "none"
+            raise ValueError(
+                f"DEFAULT_MODEL={self.DEFAULT_MODEL.value} requires {missing}, which is not "
+                f"configured. Configure it, or unset DEFAULT_MODEL to auto-select. "
+                f"Available models: {available}"
+            )
+
     @computed_field  # type: ignore[prop-decorator]
     @property
     def BASE_URL(self) -> str:
-        return f"http://{self.HOST}:{self.PORT}"
+        # HOST is a bind address. 0.0.0.0 means "listen on every interface" and is not a
+        # valid destination: connecting to it fails on Windows with WSAEADDRNOTAVAIL
+        # (10049), while POSIX silently routes it to loopback. Clients need a concrete
+        # address, so wildcards collapse to loopback here.
+        host = self.HOST.strip() or "0.0.0.0"
+        if host in {"0.0.0.0", "::"}:
+            host = "127.0.0.1"
+        if ":" in host:
+            # IPv6 literals are bracketed in URLs; without this the port is parsed as
+            # part of the address.
+            host = f"[{host}]"
+        return f"http://{host}:{self.PORT}"
 
     def is_dev(self) -> bool:
         return self.MODE == "dev"

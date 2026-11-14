@@ -5,7 +5,7 @@ import logging
 import re
 from collections.abc import Sequence
 from typing import Any
-from urllib.parse import urlparse, urlunsplit
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunsplit
 
 from langchain_core.exceptions import OutputParserException
 from langchain_core.messages import AnyMessage, SystemMessage
@@ -285,11 +285,14 @@ def url_key(url: str) -> str:
     DeepSeek Search happily returns /cn/ and /tw/ copies of the same page; those
     differ only by URL, so a naive URL comparison lets one article in twice and
     makes a single source look like two independent ones during cross-validation.
+    The identity-bearing query is kept (via clean_url) so two different articles
+    that share a path but differ by ?id= stay distinct.
     """
-    parsed = urlparse(url.strip())
+    parsed = urlparse(clean_url(url))
     host = parsed.netloc.lower().removeprefix("www.")
     path = _LANG_SEGMENT.sub("", parsed.path.rstrip("/"))
-    return f"{host}{path}"
+    key = f"{host}{path}"
+    return f"{key}?{parsed.query}" if parsed.query else key
 
 
 def confidence_from_authority(authority: int, rerank_score: float) -> float:
@@ -301,10 +304,40 @@ def confidence_from_authority(authority: int, rerank_score: float) -> float:
     return round(min(base, 1.0), 2)
 
 
+# Params that mark a share/channel, not the article itself. Dropping them lets the
+# same article shared via different channels collapse; identity params (?id=) stay.
+_TRACKING_PARAMS = frozenset(
+    {
+        "spm",
+        "from",
+        "ref",
+        "referrer",
+        "fbclid",
+        "gclid",
+        "scm",
+        "share_token",
+        "share_source",
+        "vd_source",
+    }
+)
+
+
 def clean_url(url: str) -> str:
-    """Drop fragments and query params; Search appends anchors like `#1`."""
+    """Drop fragments and tracking params; keep identity-bearing query, sorted.
+
+    Search appends anchors like `#1` and share tags like `?utm_source=`; those do
+    not identify the article. But some sites put the article id in the query
+    (`?id=1001`), so clearing the whole query would merge two different articles
+    and fetch the wrong page. Sorting makes parameter order irrelevant.
+    """
     parsed = urlparse(url.strip())
-    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
+    pairs = [
+        (key, value)
+        for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+        if key.lower() not in _TRACKING_PARAMS and not key.lower().startswith("utm_")
+    ]
+    query = urlencode(sorted(pairs))
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, query, ""))
 
 
 def clean_title(title: str) -> str:
@@ -316,16 +349,32 @@ def clean_title(title: str) -> str:
 
 
 def dedupe_sources(sources: Sequence[Source] | None) -> list[Source]:
-    """Keep the first occurrence of each page, preserving collection order."""
-    seen: set[str] = set()
-    unique: list[Source] = []
+    """Keep the first occurrence of each page, preserving collection order.
+
+    A later round may deep-read a URL the first round only skimmed, appending a
+    second copy that carries the fetched body. First-wins alone would discard that
+    paid-for content, so the kept copy is upgraded with the deeper material instead
+    of mutated in place (state holds the originals).
+    """
+    seen: dict[str, Source] = {}
+    order: list[str] = []
     for source in sources or []:
         key = url_key(source.url)
-        if not key or key in seen:
+        if not key:
             continue
-        seen.add(key)
-        unique.append(source)
-    return unique
+        kept = seen.get(key)
+        if kept is None:
+            seen[key] = source
+            order.append(key)
+            continue
+        update: dict[str, str] = {}
+        if len(source.content) > len(kept.content):
+            update["content"] = source.content
+        if len(source.summary) > len(kept.summary):
+            update["summary"] = source.summary
+        if update:
+            seen[key] = kept.model_copy(update=update)
+    return [seen[key] for key in order]
 
 
 def excerpt(text: str, limit: int = EXCERPT_CHARS) -> str:

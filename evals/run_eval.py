@@ -114,6 +114,7 @@ async def run_case(case: dict, model: str) -> dict:
             "fetch": metrics.fetch_calls if metrics else 0,
             "search_failed": metrics.search_failed if metrics else 0,
             "fetch_failed": metrics.fetch_failed if metrics else 0,
+            "fetch_skipped": metrics.fetch_skipped if metrics else 0,
             "degraded": list(metrics.degradations) if metrics else [],
         },
         "cost": estimate_cost(

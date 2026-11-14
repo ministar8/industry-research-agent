@@ -94,6 +94,10 @@ async def main() -> None:
         agent_url = os.getenv("AGENT_URL")
         if not agent_url:
             host = os.getenv("HOST", "0.0.0.0")
+            # HOST is what the service binds to; 0.0.0.0 is unroutable as a target on
+            # Windows (WSAEADDRNOTAVAIL 10049), so connect over loopback instead.
+            if host in {"0.0.0.0", "::", ""}:
+                host = "127.0.0.1"
             port = os.getenv("PORT", 8080)
             agent_url = f"http://{host}:{port}"
         try:
@@ -504,6 +508,10 @@ async def handle_feedback() -> None:
         st.session_state.last_feedback = (None, None)
 
     latest_run_id = st.session_state.messages[-1].run_id
+    # Messages replayed from /history carry no run_id; feedback can only be
+    # attributed to a live run, so don't draw the widget for them.
+    if not latest_run_id:
+        return
     feedback = st.feedback("stars", key=latest_run_id)
 
     # If the feedback value or run ID has changed, send a new feedback record

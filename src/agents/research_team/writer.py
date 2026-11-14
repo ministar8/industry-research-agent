@@ -1,6 +1,7 @@
 """Writer: turn the structured analysis into a citable report."""
 
 import logging
+import re
 from typing import Any
 
 from langchain_core.messages import AIMessage, SystemMessage
@@ -51,14 +52,24 @@ MIN_ANALYSIS_CHARS_FOR_INDEX = 1500
 
 # A constraint can ask for a table or explicitly rule one out ("不用表格"). Only the
 # former should force the schema, otherwise a bullet-only request gets a stray table.
-_TABLE_NEGATIONS = ("不用", "不使用", "不要", "无需", "不必", "避免", "非表格")
+# The negation must directly modify the table mention within the same clause, so an
+# unrelated refusal ("不要分析动力电池") cannot cancel a positive "用表格" request.
+_TABLE_NEGATION = re.compile(
+    r"(?:不用|不使用|不要|无需|不必|避免|非)(?:使用|用|做|作)?(?:任何|太多)?表格"
+)
+_CLAUSE_SPLIT = re.compile(r"[，,。;；\n]")
 
 
 def requires_table(constraints: list[str]) -> bool:
-    return any(
-        "表格" in constraint and not any(negation in constraint for negation in _TABLE_NEGATIONS)
-        for constraint in constraints
-    )
+    positive = False
+    for constraint in constraints:
+        for clause in _CLAUSE_SPLIT.split(constraint):
+            if "表格" not in clause:
+                continue
+            if _TABLE_NEGATION.search(clause):
+                return False
+            positive = True
+    return positive
 
 
 class TableBlock(BaseModel):

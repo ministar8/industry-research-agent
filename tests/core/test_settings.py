@@ -122,9 +122,35 @@ def test_settings_explicit_default_model_overrides_fake():
         assert settings.DEFAULT_MODEL == OpenAIModelName.GPT_6_LUNA
 
 
+def test_settings_default_model_of_unconfigured_provider_fails_at_startup():
+    # Without this the service starts, advertises an unusable default model, and only
+    # fails on the first request (or when the UI indexes models by default_model).
+    with patch.dict(os.environ, {"OPENAI_API_KEY": "test_key"}, clear=True):
+        with pytest.raises(ValueError, match="requires DASHSCOPE_API_KEY"):
+            Settings(_env_file=None, DEFAULT_MODEL=DashScopeModelName.QWEN_38_27B)
+
+
+def test_settings_fake_mode_tolerates_a_leftover_default_model():
+    # Fake mode never calls a provider, so a DEFAULT_MODEL left over from a real run
+    # must not block startup.
+    with patch.dict(os.environ, {"USE_FAKE_MODEL": "true"}, clear=True):
+        settings = Settings(_env_file=None, DEFAULT_MODEL=DeepseekModelName.DEEPSEEK_FLASH)
+        assert settings.DEFAULT_MODEL == DeepseekModelName.DEEPSEEK_FLASH
+
+
 def test_settings_base_url():
+    # A wildcard bind address is not routable as a destination (10049 on Windows).
     settings = Settings(HOST="0.0.0.0", PORT=8000, _env_file=None)
-    assert settings.BASE_URL == "http://0.0.0.0:8000"
+    assert settings.BASE_URL == "http://127.0.0.1:8000"
+    # A concrete bind address must be preserved: it is the address clients should use.
+    settings = Settings(HOST="192.168.1.10", PORT=8000, _env_file=None)
+    assert settings.BASE_URL == "http://192.168.1.10:8000"
+    # Trailing whitespace from .env would otherwise end up inside the URL.
+    settings = Settings(HOST="0.0.0.0 ", PORT=8000, _env_file=None)
+    assert settings.BASE_URL == "http://127.0.0.1:8000"
+    # IPv6 literals need brackets, otherwise the port is read as part of the address.
+    settings = Settings(HOST="::1", PORT=8000, _env_file=None)
+    assert settings.BASE_URL == "http://[::1]:8000"
 
 
 def test_settings_is_dev():

@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Any, Literal, NotRequired
 
-from pydantic import BaseModel, Field, SerializeAsAny
+from pydantic import BaseModel, Field, SerializeAsAny, field_validator
 from typing_extensions import TypedDict
 
 from schema.models import AllModelEnum, DeepseekModelName, OpenAIModelName
@@ -43,6 +43,7 @@ class UserInput(BaseModel):
 
     message: str = Field(
         description="User input to the agent.",
+        max_length=20_000,
         examples=["What is the weather in Tokyo?"],
     )
     model: SerializeAsAny[AllModelEnum] | None = Field(
@@ -54,11 +55,13 @@ class UserInput(BaseModel):
     thread_id: str | None = Field(
         description="Thread ID to persist and continue a multi-turn conversation.",
         default=None,
+        max_length=255,
         examples=["847c6285-8fc9-4560-a83f-4e6285809254"],
     )
     user_id: str | None = Field(
         description="User ID to persist and continue a conversation across multiple threads.",
         default=None,
+        max_length=255,
         examples=["847c6285-8fc9-4560-a83f-4e6285809254"],
     )
     agent_config: dict[str, Any] = Field(
@@ -66,6 +69,15 @@ class UserInput(BaseModel):
         default={},
         examples=[{"spicy_level": 0.8}],
     )
+
+    @field_validator("agent_config")
+    @classmethod
+    def validate_agent_config(cls, value: dict[str, Any]) -> dict[str, Any]:
+        # Validate before StreamingResponse sends headers or any checkpoint is read.
+        reserved_keys = {"thread_id", "user_id", "model", "checkpoint_id", "checkpoint_ns"}
+        if overlap := reserved_keys & value.keys():
+            raise ValueError(f"agent_config contains reserved keys: {sorted(overlap)}")
+        return value
 
 
 class StreamInput(UserInput):
@@ -125,7 +137,10 @@ class ChatMessage(BaseModel):
 
     def pretty_repr(self) -> str:
         """Get a pretty representation of the message."""
-        base_title = self.type.title() + " Message"
+        # `str.title()` would render "ai" as "Ai"; the label is a display name, not a
+        # capitalized identifier.
+        label = "AI" if self.type == "ai" else self.type.title()
+        base_title = label + " Message"
         padded = " " + base_title + " "
         sep_len = (80 - len(padded)) // 2
         sep = "=" * sep_len
@@ -168,6 +183,7 @@ class ChatHistoryInput(BaseModel):
 
     thread_id: str = Field(
         description="Thread ID to persist and continue a multi-turn conversation.",
+        max_length=255,
         examples=["847c6285-8fc9-4560-a83f-4e6285809254"],
     )
 
@@ -181,6 +197,7 @@ class UserThreadsInput(BaseModel):
 
     user_id: str = Field(
         description="User ID to list threads for.",
+        max_length=255,
         examples=["847c6285-8fc9-4560-a83f-4e6285809254"],
     )
     limit: int = Field(

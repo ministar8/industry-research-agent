@@ -13,7 +13,7 @@ from urllib.parse import urlparse
 import httpx
 
 from core import settings
-from core.metrics import record_fetch, record_search
+from core.metrics import record_fetch, record_fetch_skipped, record_search
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +102,7 @@ async def search(
 async def fetch(url: str) -> dict[str, str] | None:
     if not is_fetchable(url):
         logger.warning("Skipping unfetchable url: %s", url[:120])
+        record_fetch_skipped()
         return None
 
     data = await _post("fetch", {"url": url}, timeout=60.0)

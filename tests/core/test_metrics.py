@@ -7,6 +7,7 @@ from core.metrics import (
     end_turn,
     record_degradation,
     record_fetch,
+    record_fetch_skipped,
     record_search,
     record_usage,
 )
@@ -53,7 +54,20 @@ def test_turn_line_reports_every_dimension(caplog):
     assert "search_failed=1" in line
     assert "fetch=1" in line
     assert "fetch_failed=1" in line
+    assert "fetch_skipped=0" in line
     assert "degraded=judge_fallback" in line
+
+
+def test_fetch_skipped_is_distinct_from_failed(caplog):
+    caplog.set_level(logging.INFO, logger="core.metrics")
+    token = begin_turn("thread-skip")
+    record_fetch_skipped()
+    record_fetch(ok=False)
+    end_turn(token, "ok")
+
+    line = caplog.records[-1].getMessage()
+    assert "fetch_skipped=1" in line
+    assert "fetch_failed=1" in line
 
 
 def test_recording_without_an_open_turn_is_a_noop():
@@ -61,3 +75,16 @@ def test_recording_without_an_open_turn_is_a_noop():
     record_usage({"input_tokens": 1})
     record_search(ok=True)
     record_degradation("whatever")
+
+
+def test_thread_id_cannot_forge_a_second_log_line(caplog):
+    # thread_id is caller-supplied; an unescaped newline would let it write a line that
+    # log parsers treat as a separate, legitimate-looking event.
+    caplog.set_level(logging.INFO, logger="core.metrics")
+    token = begin_turn("a\nforged line=1\r")
+    end_turn(token, "ok")
+
+    line = caplog.records[-1].getMessage()
+    assert "\n" not in line
+    assert "\r" not in line
+    assert "thread=a\\nforged line=1\\r" in line

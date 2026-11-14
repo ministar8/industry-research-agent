@@ -69,7 +69,7 @@ uv run python src/run_service.py
 uv run streamlit run src/streamlit_app.py
 ```
 
-服务默认监听 `http://0.0.0.0:8080`，界面在 `http://localhost:8501`。界面侧栏可切换模型、浏览历史会话，并支持可选的语音输入与朗读（见[语音](#语音可选)）。
+服务默认监听 `http://0.0.0.0:8080`，界面在 `http://localhost:8501`。界面默认连接本机 `127.0.0.1:8080`，服务不在本机时用 `AGENT_URL` 指定。界面侧栏可切换模型、浏览历史会话，并支持可选的语音输入与朗读（见[语音](#语音可选)）。
 
 无需真实 API key 也可以验证链路连通性：
 
@@ -90,11 +90,12 @@ USE_FAKE_MODEL=true uv run python src/run_service.py
 | `DASHSCOPE_BASE_URL` | 百炼兼容端点，工作空间迁移后需改 | 旧版 `dashscope.aliyuncs.com` |
 | `DASHSCOPE_ENABLE_THINKING` | 百炼托管模型是否开启思考；DeepSeek V4.1 下必须关闭（开启后会在补全上限内耗尽预算） | `false` |
 | `LLM_MAX_TOKENS` | 单次补全上限；开思考时须同时容纳思考与可见正文 | `16384` |
-| `DEFAULT_MODEL` | 覆盖默认模型。百炼侧：`deepseek-v4.1-flash` / `deepseek-v4.1-flash-1017` / `qwen3.8-27b`；DeepSeek 直连：`deepseek-flash` / `deepseek-v4-pro`；另有 OpenAI 与 `fake` | 按 key 选择：百炼 → `deepseek-v4.1-flash-1017`，DeepSeek → `deepseek-flash` |
+| `DEFAULT_MODEL` | 覆盖默认模型。百炼侧：`deepseek-v4.1-flash` / `deepseek-v4.1-flash-1017` / `qwen3.8-27b`；DeepSeek 直连：`deepseek-flash` / `deepseek-v4-pro`；另有 OpenAI 与 `fake`。必须是已配置 provider 的模型，否则启动即报错并指出缺哪个 key | 按 key 选择：百炼 → `deepseek-v4.1-flash-1017`，DeepSeek → `deepseek-flash` |
 | `OPENAI_API_KEY` | OpenAI 直连模型（可选），同时是语音功能的凭据 | 空 |
 | `COMPATIBLE_BASE_URL` / `COMPATIBLE_MODEL` | 任意 OpenAI 兼容网关（vLLM / SGLang / 内部网关） | 空 |
 | `AUTH_SECRET` | Bearer token；**未设置时除 `/health` 外所有端点无鉴权** | 空 |
 | `HOST` / `PORT` / `MODE` | 监听地址、端口；`MODE=dev` 开启热重载 | `0.0.0.0` / `8080` / 空 |
+| `LOG_LEVEL` | 日志级别；指标行与 token 归因分别是 INFO / DEBUG，默认级别下不输出 | `WARNING` |
 | `DATABASE_TYPE` | `sqlite` / `postgres` / `mongo` | `sqlite` |
 | `USE_FAKE_MODEL` | 使用假模型验证链路 | `false` |
 | `VOICE_STT_PROVIDER` / `VOICE_TTS_PROVIDER` | 语音识别 / 合成提供方，当前仅实现 `openai`；留空即关闭 | 空 |
@@ -284,11 +285,12 @@ Writer 只拿编号索引、不拿原文摘录，是实测结论而非猜测：�
 
 ## 观测
 
-每个请求结束时会打一行结构化日志：
+把 `LOG_LEVEL` 设为 `INFO` 后，每个请求结束时会打一行结构化日志；默认的 `WARNING` 级别下这一行不会出现：
 
 ```text
 turn thread=metrics-smoke-4 status=ok elapsed=29.4s llm_calls=8 tokens_in=26196
-tokens_out=3866 reasoning=0 search=4 fetch=2 search_failed=0 fetch_failed=1 degraded=-
+tokens_out=3866 reasoning=0 search=4 fetch=2 search_failed=0 fetch_failed=1
+fetch_skipped=0 degraded=-
 ```
 
 | 字段 | 含义 |
@@ -297,6 +299,7 @@ tokens_out=3866 reasoning=0 search=4 fetch=2 search_failed=0 fetch_failed=1 degr
 | `llm_calls` | 本轮模型调用次数，含结构化输出失败后的重试 |
 | `tokens_in` / `tokens_out` / `reasoning` | 输入、输出与思考 token |
 | `search` / `fetch` | 成功调用次数；失败单独计数 |
+| `fetch_skipped` | 深读目标因 URL 不可 fetch 被跳过的次数；未发起请求，不计入 `fetch_failed` |
 | `degraded` | 本轮触发的降级路径，逗号分隔、同值去重；无则 `-` |
 
 计数器存放在 `core/metrics.py` 的 contextvar 中，不写入 `ResearchState`——它描述一次请求，
