@@ -16,6 +16,10 @@ REQUIRED_SECTIONS = ("## 摘要", "## 主要发现", "## 分析", "## 结论")
 
 CAVEAT_MARKERS = ("单源", "单一来源", "未验证", "无法验证", "矛盾", "不一致", "口径")
 
+# Internal scaffolding terms that must never surface in a user-facing report.
+# "交付说明"/"表外" stay out: legitimate business/finance words, not leak markers.
+META_LEAK = re.compile(r"tables\s*字段|字段留空|供内部核对|非报告正文|来源编号表|给定来源")
+
 HINT_MARKER = "识别出可调研的对象"
 
 
@@ -54,6 +58,41 @@ def table_rows(text: str) -> int:
 
 def bullet_items(text: str) -> int:
     return sum(1 for line in text.splitlines() if re.match(r"^\s*(?:[-*]|\d+[.)])\s+\S", line))
+
+
+_ANCHOR_TAIL = re.compile(r"(?:\[\d+\]\s*)+$")
+_SENTENCE_END = "。！？；…」』\"'.!?;"
+_PROSE_SECTIONS = ("摘要", "分析", "结论")
+
+
+def _ends_cleanly(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return False
+    return bool(_ANCHOR_TAIL.search(stripped)) or stripped[-1] in _SENTENCE_END
+
+
+def truncated_sections(report: str) -> list[str]:
+    """Sections whose prose stops mid-sentence instead of ending on punctuation.
+
+    Constrained decoding can close a JSON string at any token, so a rendered
+    report may carry "…市场格局呈" with no error anywhere upstream. Table rows and
+    captions inside 主要发现 are not prose and are skipped.
+    """
+    bad: list[str] = []
+    for section in re.split(r"^## ", report, flags=re.MULTILINE)[1:]:
+        title, _, body = section.partition("\n")
+        title = title.strip()
+        if title == "主要发现":
+            bullets = [
+                line for line in body.splitlines() if re.match(r"^\s*(?:[-*]|\d+[.)])\s+\S", line)
+            ]
+            if any(not _ends_cleanly(line) for line in bullets):
+                bad.append(title)
+        elif title in _PROSE_SECTIONS:
+            if body.strip() and not _ends_cleanly(body):
+                bad.append(title)
+    return bad
 
 
 def run_checks(
@@ -105,6 +144,12 @@ def run_checks(
         elif name == "sections":
             missing = [item for item in REQUIRED_SECTIONS if item not in report]
             results.append(CheckResult(check, not missing, f"缺失 {missing}" if missing else ""))
+        elif name == "complete":
+            bad = truncated_sections(report)
+            results.append(CheckResult(check, not bad, "" if not bad else f"半句话收尾 {bad}"))
+        elif name == "meta":
+            hit = sorted(set(META_LEAK.findall(report)))
+            results.append(CheckResult(check, not hit, "" if not hit else f"元文本标记 {hit}"))
         elif name == "caveat":
             hit = any(marker in answer for marker in CAVEAT_MARKERS)
             results.append(CheckResult(check, hit, "" if hit else "未见单源/矛盾/口径类提示"))

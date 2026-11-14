@@ -37,6 +37,11 @@ FALLBACK_MIN_AUTHORITY = 2
 FALLBACK_MIN_RERANK = 1.5
 FALLBACK_REASON = "评分阈值降级（相关性判定不可用）"
 
+# Query plans and relevance judgements are small outputs; cap them so a degenerate
+# runaway generation dies cheap instead of burning the full shared LLM_MAX_TOKENS.
+QUERY_PLAN_MAX_TOKENS = 2048
+JUDGE_MAX_TOKENS = 4096
+
 RESEARCHER_PROMPT = """你是行业与竞品调研团队的检索员。你只做一件事：针对分配到的子问题采集原始素材，
 并如实记录来源。你不下结论，也不写报告。
 
@@ -119,7 +124,7 @@ def _fallback_queries(state: ResearchState) -> list[str]:
 async def _plan_queries(state: ResearchState, config: RunnableConfig) -> list[str]:
     try:
         model: Any = resolve_model(config)
-        planner = structured_output(model, QueryPlan, "planner")
+        planner = structured_output(model, QueryPlan, "planner", max_tokens=QUERY_PLAN_MAX_TOKENS)
         messages = [
             SystemMessage(content=RESEARCHER_PROMPT),
             SystemMessage(content=_task_brief(state)),
@@ -156,7 +161,7 @@ async def _judge(
     )
     try:
         model: Any = resolve_model(config)
-        judge = structured_output(model, SourceJudgements, "judge")
+        judge = structured_output(model, SourceJudgements, "judge", max_tokens=JUDGE_MAX_TOKENS)
         messages = [
             SystemMessage(content=RESEARCHER_PROMPT),
             SystemMessage(content=_judge_brief(state)),

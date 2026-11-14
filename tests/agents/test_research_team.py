@@ -43,6 +43,7 @@ from agents.research_team.writer import (
     ReportBundle,
     TableBlock,
     TableRequiredReport,
+    _is_complete,
     render_report,
     report_schema,
     requires_table,
@@ -101,7 +102,7 @@ def test_route_defaults_to_finalize_without_action():
 
 def decision(target: str) -> RoutingDecision:
     return RoutingDecision(
-        intent="测试", is_research=True, sub_questions=[], next=target, reason="r"
+        intent="测试", is_research=True, sub_questions=[], constraints=[], next=target, reason="r"
     )
 
 
@@ -125,6 +126,28 @@ def test_writer_allowed_with_analysis():
         "analysis": "## 事实基线",
     }
     assert _enforce(decision("writer"), state) == "writer"
+
+
+def test_researcher_blocked_when_sources_await_analysis():
+    state = {
+        "messages": [HumanMessage(content="调研")],
+        "sources": [make_source("https://a.example/1")],
+    }
+    assert _enforce(decision("researcher"), state) == "analyst"
+
+
+def test_researcher_allowed_without_sources():
+    state = {"messages": [HumanMessage(content="调研")], "sources": []}
+    assert _enforce(decision("researcher"), state) == "researcher"
+
+
+def test_researcher_allowed_after_analysis():
+    state = {
+        "messages": [HumanMessage(content="调研")],
+        "sources": [make_source("https://a.example/1")],
+        "analysis": "## 事实基线",
+    }
+    assert _enforce(decision("researcher"), state) == "researcher"
 
 
 @pytest.mark.asyncio
@@ -177,6 +200,22 @@ async def test_finalize_reports_failure_after_a_failed_run():
         }
     )
     assert "未能采集到可用信息" in result["messages"][0].content
+
+
+@pytest.mark.asyncio
+async def test_finalize_distinguishes_collected_sources_from_empty_run():
+    result = await finalize(
+        {
+            "messages": [HumanMessage(content="调研")],
+            "sources": [make_source("https://a.example/1"), make_source("https://a.example/2")],
+            "rounds": 6,
+            "turn_attempted": True,
+        }
+    )
+    content = result["messages"][0].content
+    assert "已采集 2 条来源" in content
+    assert "未能完成分析" in content
+    assert "未能采集到可用信息" not in content
 
 
 @pytest.mark.asyncio
@@ -237,7 +276,7 @@ class _StubModel:
         self._decision = decision
 
     def with_structured_output(
-        self, schema: type, method: str | None = None, include_raw: bool = False
+        self, schema: type, method: str | None = None, include_raw: bool = False, **kwargs
     ) -> _StubDecider:
         return _StubDecider(self._decision)
 
@@ -302,7 +341,7 @@ class _CapturingModel:
         self._captured = captured
 
     def with_structured_output(
-        self, schema: type, method: str | None = None, include_raw: bool = False
+        self, schema: type, method: str | None = None, include_raw: bool = False, **kwargs
     ) -> _CapturingDecider:
         return _CapturingDecider(self._result, self._captured)
 
@@ -443,6 +482,154 @@ async def test_supervisor_resets_constraints_on_a_new_turn():
     assert update["constraints"] == ["地区：欧洲"]
 
 
+@pytest.mark.asyncio
+async def test_supervisor_breaks_pre_analysis_research_loop():
+    decision = RoutingDecision(
+        intent="调研",
+        is_research=True,
+        sub_questions=["问题"],
+        constraints=[],
+        next="researcher",
+        reason="r",
+    )
+    with (
+        patch("agents.research_team.supervisor.settings.USE_FAKE_MODEL", False),
+        patch("agents.research_team.supervisor.resolve_model", return_value=_StubModel(decision)),
+    ):
+        first = await supervisor(
+            {"messages": [HumanMessage(content="调研")], "rounds": 0},
+            None,  # type: ignore[arg-type]
+        )
+        assert first["next_action"] == "researcher"
+        token = begin_turn("loop-test")
+        try:
+            second = await supervisor(
+                {
+                    "messages": [HumanMessage(content="调研"), AIMessage(content="检索完成")],
+                    "sources": [make_source("https://a.example/1")],
+                    "rounds": 1,
+                    "intent": "调研",
+                },
+                None,  # type: ignore[arg-type]
+            )
+        finally:
+            metrics = current()
+            end_turn(token)
+        assert second["next_action"] == "analyst"
+        assert metrics is not None
+        assert "researcher_forced_analyst" in metrics.degradations
+
+
+def test_routing_decision_schema_requires_lists():
+    schema = RoutingDecision.model_json_schema()
+    assert "sub_questions" in schema["required"]
+    assert "constraints" in schema["required"]
+
+
+def test_routing_decision_accepts_empty_lists():
+    decision = RoutingDecision.model_validate(
+        {
+            "intent": "你好",
+            "is_research": False,
+            "sub_questions": [],
+            "constraints": [],
+            "next": "finalize",
+            "reason": "闲聊",
+        }
+    )
+    assert decision.sub_questions == []
+    assert decision.constraints == []
+
+
+def test_routing_decision_tolerates_missing_lists():
+    decision = RoutingDecision.model_validate(
+        {"intent": "测试", "is_research": True, "next": "researcher", "reason": "r"}
+    )
+    assert decision.sub_questions == []
+    assert decision.constraints == []
+
+
+@pytest.mark.asyncio
+async def test_supervisor_falls_back_to_intent_task():
+    decision = RoutingDecision(
+        intent="调研储能电芯格局",
+        is_research=True,
+        sub_questions=[],
+        constraints=[],
+        next="researcher",
+        reason="r",
+    )
+    token = begin_turn("fallback-test")
+    try:
+        with (
+            patch("agents.research_team.supervisor.settings.USE_FAKE_MODEL", False),
+            patch(
+                "agents.research_team.supervisor.resolve_model", return_value=_StubModel(decision)
+            ),
+        ):
+            update = await supervisor(
+                {"messages": [HumanMessage(content="调研")], "rounds": 0},
+                None,  # type: ignore[arg-type]
+            )
+    finally:
+        metrics = current()
+        end_turn(token)
+    assert [task.question for task in update["tasks"]] == ["调研储能电芯格局"]
+    assert metrics is not None
+    assert "sub_questions_missing" in metrics.degradations
+
+
+@pytest.mark.asyncio
+async def test_supervisor_keeps_existing_tasks_without_sub_questions():
+    decision = RoutingDecision(
+        intent="继续",
+        is_research=True,
+        sub_questions=[],
+        constraints=[],
+        next="researcher",
+        reason="r",
+    )
+    with (
+        patch("agents.research_team.supervisor.settings.USE_FAKE_MODEL", False),
+        patch("agents.research_team.supervisor.resolve_model", return_value=_StubModel(decision)),
+    ):
+        update = await supervisor(
+            {
+                "messages": [HumanMessage(content="调研"), AIMessage(content="检索完成")],
+                "tasks": [ResearchTask(id="T1", question="既有问题")],
+                "rounds": 1,
+            },
+            None,  # type: ignore[arg-type]
+        )
+    assert "tasks" not in update
+
+
+@pytest.mark.asyncio
+async def test_supervisor_does_not_fall_back_for_analyst():
+    decision = RoutingDecision(
+        intent="分析",
+        is_research=True,
+        sub_questions=[],
+        constraints=[],
+        next="analyst",
+        reason="r",
+    )
+    with (
+        patch("agents.research_team.supervisor.settings.USE_FAKE_MODEL", False),
+        patch("agents.research_team.supervisor.resolve_model", return_value=_StubModel(decision)),
+    ):
+        update = await supervisor(
+            {
+                "messages": [HumanMessage(content="调研"), AIMessage(content="检索完成")],
+                "sources": [make_source("https://a.example/1")],
+                "rounds": 1,
+            },
+            None,  # type: ignore[arg-type]
+        )
+    assert update["next_action"] == "analyst"
+    assert "tasks" not in update
+
+
 def test_url_key_collapses_language_variants():
     simplified = "https://www.infolink-group.com/cn/energy-2025"
     traditional = "https://infolink-group.com/tw/energy-2025"
@@ -455,6 +642,21 @@ def test_dedupe_sources_merges_language_variants():
         Source(url="https://x.example/tw/post", title="繁體版"),
     ]
     assert [s.title for s in dedupe_sources(sources)] == ["简体版"]
+
+
+def test_url_key_collapses_mobile_variants():
+    desktop = "https://www.infolink-group.com/energy-2025"
+    mobile = "https://m.infolink-group.com/energy-2025"
+    assert url_key(desktop) == url_key(mobile)
+    assert url_key("https://m.x.example/cn/post") == url_key("https://www.x.example/tw/post")
+
+
+def test_dedupe_sources_merges_mobile_variants():
+    sources = [
+        Source(url="https://x.example/post", title="桌面版"),
+        Source(url="https://m.x.example/post", title="手机版"),
+    ]
+    assert [s.title for s in dedupe_sources(sources)] == ["桌面版"]
 
 
 def test_clean_url_keeps_identity_query_but_drops_tracking():
@@ -629,7 +831,7 @@ class _ListWrappingModel:
     """Mimics DashScope returning `[{...}]` where the schema wants `{...}`."""
 
     def with_structured_output(
-        self, schema: type, method: str | None = None, include_raw: bool = False
+        self, schema: type, method: str | None = None, include_raw: bool = False, **kwargs
     ) -> object:
         payload = json.dumps(
             [
@@ -678,7 +880,7 @@ class _StrictRejectingModel:
         self.methods: list[str | None] = []
 
     def with_structured_output(
-        self, schema: type, method: str | None = None, include_raw: bool = False
+        self, schema: type, method: str | None = None, include_raw: bool = False, **kwargs
     ) -> object:
         self.methods.append(method)
         decision = self._decision
@@ -695,7 +897,12 @@ class _StrictRejectingModel:
 @pytest.mark.asyncio
 async def test_structured_output_falls_back_when_json_schema_is_rejected():
     decision = RoutingDecision(
-        intent="测试", is_research=True, next="researcher", reason="需要检索"
+        intent="测试",
+        is_research=True,
+        sub_questions=[],
+        constraints=[],
+        next="researcher",
+        reason="需要检索",
     )
     model = _StrictRejectingModel(decision)
 
@@ -706,10 +913,43 @@ async def test_structured_output_falls_back_when_json_schema_is_rejected():
 
 
 @pytest.mark.asyncio
+async def test_structured_output_forwards_max_tokens_budget():
+    captured: list[dict] = []
+
+    class _BudgetModel:
+        def with_structured_output(
+            self, schema: type, method: str | None = None, include_raw: bool = False, **kwargs
+        ) -> object:
+            captured.append(kwargs)
+
+            class _Decider:
+                async def ainvoke(self, messages: list) -> dict:
+                    decision = RoutingDecision(
+                        intent="测试",
+                        is_research=True,
+                        sub_questions=[],
+                        constraints=[],
+                        next="researcher",
+                        reason="需要检索",
+                    )
+                    return {"raw": None, "parsed": decision, "parsing_error": None}
+
+            return _Decider()
+
+    await structured_output(_BudgetModel(), RoutingDecision, "supervisor", max_tokens=2048).ainvoke(
+        []
+    )
+    assert captured[-1].get("max_tokens") == 2048
+
+    await structured_output(_BudgetModel(), RoutingDecision).ainvoke([])
+    assert "max_tokens" not in captured[-1]
+
+
+@pytest.mark.asyncio
 async def test_structured_output_does_not_swallow_unrelated_errors():
     class _Broken:
         def with_structured_output(
-            self, schema: type, method: str | None = None, include_raw: bool = False
+            self, schema: type, method: str | None = None, include_raw: bool = False, **kwargs
         ) -> object:
             class _Decider:
                 async def ainvoke(self, messages: list) -> dict:
@@ -736,7 +976,7 @@ class _OverrunningModel:
         self.calls = 0
 
     def with_structured_output(
-        self, schema: type, method: str | None = None, include_raw: bool = False
+        self, schema: type, method: str | None = None, include_raw: bool = False, **kwargs
     ) -> object:
         decision = self._decision
         parent = self
@@ -753,7 +993,14 @@ class _OverrunningModel:
 
 @pytest.mark.asyncio
 async def test_structured_output_retries_with_shorter_brief_after_length_overrun():
-    decision = RoutingDecision(intent="测试", is_research=True, next="writer", reason="已有分析")
+    decision = RoutingDecision(
+        intent="测试",
+        is_research=True,
+        sub_questions=[],
+        constraints=[],
+        next="writer",
+        reason="已有分析",
+    )
     model = _OverrunningModel(decision)
 
     result = await structured_output(model, RoutingDecision).ainvoke([])
@@ -977,7 +1224,7 @@ class _SequenceModel:
         self._captured = captured
 
     def with_structured_output(
-        self, schema: type, method: str | None = None, include_raw: bool = False
+        self, schema: type, method: str | None = None, include_raw: bool = False, **kwargs
     ) -> object:
         results = self._results
         captured = self._captured
@@ -1022,6 +1269,55 @@ async def test_writer_retries_when_the_report_is_hollow():
     assert len(captured) == 2
     assert "上一次输出不完整" in captured[1]
     assert "这是补全后的分析段落" in out["report"]
+
+
+def _bundle(**overrides) -> ReportBundle:
+    fields = {
+        "title": "标题",
+        "summary": "全年销量约 2.9 万辆，同比增长 95% [1]。",
+        "findings": ["发现甲，销量第一 [1]。", "发现乙，份额 24.9% [2]。"],
+        "tables": [TableBlock(headers=["企业", "份额"], rows=[["徐工", "24.9%"]])],
+        "analysis": "换电路线份额被充电路线侵蚀，增量集中在资源运输场景 [7]。",
+        "conclusion": "格局未固化，宜按季度跟踪份额变化 [1][2]。",
+    }
+    return ReportBundle(**(fields | overrides))
+
+
+def test_is_complete_rejects_mid_sentence_fields():
+    # Observed against DashScope constrained decoding: finish_reason=stop, valid
+    # JSON, but the model closed the string right after "呈" / "中".
+    truncated = _bundle(
+        summary="全年销量约 2.9 万辆，同比增长 95%，占新能源重卡市场 35% [1][2]。市场格局呈",
+        analysis="增量主要由局部资源运输需求驱动，而非全国性普适渗透。竞争格局呈",
+        conclusion="全年前五强完整份额结构不完整；此外来源 [6][8] 份额表中",
+    )
+    assert _is_complete(truncated) is False
+
+
+def test_is_complete_accepts_punctuation_and_anchor_endings():
+    assert _is_complete(_bundle()) is True
+    assert _is_complete(_bundle(conclusion="运营商份额数据缺失，无法确证 [9][10]")) is True
+    assert _is_complete(_bundle(findings=["发现甲 [1]", "发现乙 [2]"])) is True
+
+
+def test_is_complete_rejects_truncated_finding():
+    assert _is_complete(_bundle(findings=["发现甲，销量第一 [1]。", "发现乙，份额"])) is False
+
+
+@pytest.mark.asyncio
+async def test_writer_retries_when_fields_end_mid_sentence():
+    truncated = _bundle(summary="全年销量约 2.9 万辆，同比增长 95% [1]。市场格局呈")
+    complete = _bundle()
+    captured: list[str] = []
+    with patch(
+        "agents.research_team.writer.resolve_model",
+        return_value=_SequenceModel([truncated, complete], captured),
+    ):
+        out = await writer(_writer_state("完整分析" * 400), None)  # type: ignore[arg-type]
+
+    assert len(captured) == 2
+    assert "上一次输出不完整" in captured[1]
+    assert "市场格局呈" not in out["report"]
 
 
 @pytest.mark.asyncio

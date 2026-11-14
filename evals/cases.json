@@ -10,6 +10,8 @@
       "exclude:锂矿",
       "table",
       "anchors",
+      "complete",
+      "meta",
       "sources_min:6",
       "caveat"
     ]
@@ -23,6 +25,8 @@
       "exclude:乘用车",
       "bullets",
       "anchors",
+      "complete",
+      "meta",
       "sources_min:5"
     ]
   },
@@ -36,6 +40,8 @@
       "mention:宁德时代",
       "mention:比亚迪",
       "anchors",
+      "complete",
+      "meta",
       "sources_min:6",
       "sections"
     ]
@@ -49,6 +55,8 @@
       "mention:谐波",
       "sections",
       "anchors",
+      "complete",
+      "meta",
       "sources_min:6",
       "caveat"
     ]

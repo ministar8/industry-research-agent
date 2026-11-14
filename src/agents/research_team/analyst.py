@@ -38,6 +38,10 @@ ANALYST_PROMPT = """你是行业与竞品调研团队的分析师。输入是检
 
 MAX_SOURCES_FOR_ANALYSIS = 12
 
+# The fact base is prose-heavy but bounded; this leaves several times the normal
+# output as headroom while still capping a degenerate runaway generation.
+ANALYSIS_MAX_TOKENS = 8192
+
 _THIN_ANALYSIS_RETRY = SystemMessage(
     content="上一次分析的「事实基线」不足两条或内容为空。请回到来源编号表，"
     "逐条提取可引用的具体事实（含数字与口径），不要写「无可用事实」。"
@@ -80,7 +84,7 @@ async def analyst(state: ResearchState, config: RunnableConfig) -> dict[str, Any
         }
 
     model: Any = resolve_model(config)
-    structured = structured_output(model, AnalysisBundle, "analyst")
+    structured = structured_output(model, AnalysisBundle, "analyst", max_tokens=ANALYSIS_MAX_TOKENS)
     constraints = "\n".join(f"- {c}" for c in state.get("constraints") or []) or "（无）"
     messages = [
         SystemMessage(content=ANALYST_PROMPT),

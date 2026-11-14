@@ -39,6 +39,9 @@ WRITER_PROMPT = """你是行业与竞品调研团队的撰稿人。输入是结�
 - 若约束明确不要表格：tables 留空，用项目符号呈现。
 - 不得使用「据我所知」「一般来说」这类无来源的表述。
 - 直接成文，不要先列提纲，也不要复述思考过程。
+- 报告正文不得出现元文本：不写自检清单、交付说明、字段说明，也不提及「来源编号表」「给定来源」
+  「tables 字段」等内部输入名称；引用来源直接用锚点 [n]，描述信息缺口用「现有来源/已采集来源」。
+  约束满足情况由系统校验，无需声明。
 - 用中文书面语，不使用感叹号，不使用营销语气。"""
 
 MAX_SOURCES_FOR_REPORT = 12
@@ -145,21 +148,36 @@ def render_report(bundle: ReportBundle, source_count: int) -> str:
 
 
 _COMPLETENESS_REMINDER = SystemMessage(
-    content="上一次输出不完整：主要发现、分析、结论都不得为空，摘要不得只有半句话。"
-    "请基于给定的分析结果补全后重新输出，不要新增事实。"
+    content="上一次输出不完整：存在空字段或在半句话处截断的字段。请基于给定的分析结果补全后重新输出："
+    "摘要、分析、结论与每条主要发现都必须以完整句子收尾（句读或引用锚点结束），不要新增事实。"
 )
+
+_ANCHOR_TAIL = re.compile(r"(?:\[\d+\]\s*)+$")
+_SENTENCE_END = "。！？；…」』\"'.!?;"
+
+
+def _ends_cleanly(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return False
+    return bool(_ANCHOR_TAIL.search(stripped)) or stripped[-1] in _SENTENCE_END
 
 
 def _is_complete(bundle: ReportBundle) -> bool:
-    """Reject the degenerate bundle the model sometimes emits under long context.
+    """Reject hollow bundles and fields closed mid-sentence.
 
-    A schema-valid object can still be empty ({"summary": "...", "analysis": ""}),
-    which renders as a 100-character report with headings and nothing under them.
+    Constrained decoding lets the model close a JSON string at any token, so a
+    schema-valid bundle can still carry half a sentence ("…市场格局呈") with
+    finish_reason=stop. Length alone cannot see that; every prose field must end
+    with sentence punctuation or a citation anchor.
     """
     if len(bundle.findings) < 2:
         return False
+    if not all(_ends_cleanly(item) for item in bundle.findings):
+        return False
     return all(
-        len(field.strip()) >= 20 for field in (bundle.summary, bundle.analysis, bundle.conclusion)
+        len(field.strip()) >= 20 and _ends_cleanly(field)
+        for field in (bundle.summary, bundle.analysis, bundle.conclusion)
     )
 
 
@@ -196,6 +214,8 @@ async def writer(state: ResearchState, config: RunnableConfig) -> dict[str, Any]
         logger.warning("Writer returned an incomplete report, retrying once")
         record_degradation("report_incomplete")
         bundle = await structured.ainvoke([*messages, _COMPLETENESS_REMINDER])
+        if not _is_complete(bundle):
+            logger.warning("Writer report still incomplete after retry")
     report = render_report(bundle, len(sources))
 
     return {"report": report, "messages": [AIMessage(content=f"报告已完成：《{bundle.title}》")]}

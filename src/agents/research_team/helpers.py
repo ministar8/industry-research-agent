@@ -49,7 +49,9 @@ _LENGTH_RETRY = SystemMessage(
 )
 
 
-def structured_output(model: Any, schema: type, label: str = "") -> Any:
+def structured_output(
+    model: Any, schema: type, label: str = "", max_tokens: int | None = None
+) -> Any:
     """Bind a pydantic schema, preferring constrained decoding.
 
     `json_schema` is the reliable path: the provider constrains generation, so the
@@ -63,15 +65,22 @@ def structured_output(model: Any, schema: type, label: str = "") -> Any:
 
     `include_raw=True` keeps the AIMessage, which is the only place token usage is
     readable once the output has been reduced to a pydantic model.
+
+    `max_tokens` overrides the model's completion ceiling for this call only, so a
+    small decision schema can cap a degenerate runaway generation cheaply instead
+    of burning the full shared budget.
     """
-    return _StructuredOutput(model, schema, label)
+    return _StructuredOutput(model, schema, label, max_tokens)
 
 
 class _StructuredOutput:
-    def __init__(self, model: Any, schema: type, label: str = "") -> None:
+    def __init__(
+        self, model: Any, schema: type, label: str = "", max_tokens: int | None = None
+    ) -> None:
         self._model = model
         self._schema = schema
         self._label = label or "-"
+        self._max_tokens = max_tokens
         # Capability belongs to the endpoint, not the model name: the same id can be
         # served by a provider that rejects json_schema.
         self._key = (
@@ -82,6 +91,9 @@ class _StructuredOutput:
         self._hint = _schema_hint(self._api_schema)
         self._strict: Any = None
         self._loose: Any = None
+
+    def _budget_kwargs(self) -> dict[str, Any]:
+        return {"max_tokens": self._max_tokens} if self._max_tokens is not None else {}
 
     async def ainvoke(self, messages: list[AnyMessage]) -> Any:
         try:
@@ -119,7 +131,7 @@ class _StructuredOutput:
     async def _strict_call(self, messages: list[AnyMessage]) -> dict[str, Any]:
         if self._strict is None:
             self._strict = self._model.with_structured_output(
-                self._api_schema, method="json_schema", include_raw=True
+                self._api_schema, method="json_schema", include_raw=True, **self._budget_kwargs()
             )
         result = await self._strict.ainvoke(messages)
         record_usage(getattr(result.get("raw"), "usage_metadata", None), self._label)
@@ -128,7 +140,7 @@ class _StructuredOutput:
     async def _loose_call(self, messages: list[AnyMessage]) -> Any:
         if self._loose is None:
             self._loose = self._model.with_structured_output(
-                self._schema, method="json_mode", include_raw=True
+                self._schema, method="json_mode", include_raw=True, **self._budget_kwargs()
             )
         payload = [self._hint, *messages]
         result = await self._call(payload)
@@ -280,16 +292,17 @@ def _schema_hint(parameters: dict[str, Any]) -> SystemMessage:
 
 
 def url_key(url: str) -> str:
-    """Normalise a URL so language variants of the same article collapse.
+    """Normalise a URL so language and mobile variants of the same article collapse.
 
-    DeepSeek Search happily returns /cn/ and /tw/ copies of the same page; those
-    differ only by URL, so a naive URL comparison lets one article in twice and
-    makes a single source look like two independent ones during cross-validation.
-    The identity-bearing query is kept (via clean_url) so two different articles
-    that share a path but differ by ?id= stay distinct.
+    DeepSeek Search happily returns /cn/ and /tw/ copies of the same page, plus
+    m./www. host variants; those differ only by URL, so a naive URL comparison
+    lets one article in twice and makes a single source look like two independent
+    ones during cross-validation. The identity-bearing query is kept (via
+    clean_url) so two different articles that share a path but differ by ?id=
+    stay distinct.
     """
     parsed = urlparse(clean_url(url))
-    host = parsed.netloc.lower().removeprefix("www.")
+    host = parsed.netloc.lower().removeprefix("www.").removeprefix("m.")
     path = _LANG_SEGMENT.sub("", parsed.path.rstrip("/"))
     key = f"{host}{path}"
     return f"{key}?{parsed.query}" if parsed.query else key

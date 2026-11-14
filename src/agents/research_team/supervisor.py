@@ -7,7 +7,7 @@ from typing import Any, Literal
 
 from langchain_core.messages import AIMessage, AnyMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from agents.research_team.helpers import (
     dedupe_sources,
@@ -17,8 +17,13 @@ from agents.research_team.helpers import (
 )
 from agents.research_team.state import NextAction, ResearchState, ResearchTask
 from core import settings
+from core.metrics import record_degradation
 
 MAX_ROUNDS = 5
+
+# RoutingDecision is a few hundred tokens at most; a tight ceiling makes a degenerate
+# runaway generation die cheap instead of burning the full shared LLM_MAX_TOKENS.
+ROUTING_MAX_TOKENS = 2048
 
 SUPERVISOR_PROMPT = """你是行业与竞品调研团队的调度中枢。你不搜索、不写作、不做分析，只做四件事：
 
@@ -63,13 +68,21 @@ class RoutingDecision(BaseModel):
     intent: str = Field(description="提炼后的调研目标，一句话，已剥离寒暄与背景")
     is_research: bool = Field(description="是否包含需要外部信息的调研需求")
     sub_questions: list[str] = Field(
-        default_factory=list, description="拆解出的可独立回答的子问题，1-4 个"
+        description="拆解出的可独立回答的子问题，调研轮 1-4 个，非调研轮给空列表"
     )
-    constraints: list[str] = Field(
-        default_factory=list, description="必须保真的范围限定与交付要求，没有则空列表"
-    )
+    constraints: list[str] = Field(description="必须保真的范围限定与交付要求，没有则空列表")
     next: NextAction = Field(description="下一步的路由目标")
     reason: str = Field(description="路由理由，一句话")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _fill_missing_lists(cls, data: Any) -> Any:
+        # Schema-required so constrained decoding must emit them; tolerant here so the
+        # json_mode fallback and direct construction keep the old implicit defaults.
+        if isinstance(data, dict):
+            data.setdefault("sub_questions", [])
+            data.setdefault("constraints", [])
+        return data
 
 
 def _status_block(state: ResearchState) -> str:
@@ -99,6 +112,10 @@ def _enforce(decision: RoutingDecision, state: ResearchState) -> NextAction:
         return "researcher"
     if target == "writer" and not has_analysis:
         return "analyst" if has_sources else "researcher"
+    if target == "researcher" and has_sources and not has_analysis:
+        # Pre-analysis re-search can loop to the round cap and discard everything collected.
+        record_degradation("researcher_forced_analyst")
+        return "analyst"
     return target
 
 
@@ -115,6 +132,7 @@ def _fake_decision() -> RoutingDecision:
         intent="假模型模式，跳过调研流程",
         is_research=False,
         sub_questions=[],
+        constraints=[],
         next="finalize",
         reason="USE_FAKE_MODEL 已启用，仅验证链路连通性",
     )
@@ -136,7 +154,9 @@ async def supervisor(state: ResearchState, config: RunnableConfig) -> dict[str, 
         decision = _fake_decision()
     else:
         model: Any = resolve_model(config)
-        decider = structured_output(model, RoutingDecision, "supervisor")
+        decider = structured_output(
+            model, RoutingDecision, "supervisor", max_tokens=ROUTING_MAX_TOKENS
+        )
         messages: list[AnyMessage] = [
             SystemMessage(content=SUPERVISOR_PROMPT + "\n\n" + _status_block(state))
         ]
@@ -156,6 +176,9 @@ async def supervisor(state: ResearchState, config: RunnableConfig) -> dict[str, 
     if target in {"researcher", "analyst", "writer"}:
         if decision.sub_questions:
             update["tasks"] = _to_tasks(decision.sub_questions)
+        elif target == "researcher" and not state.get("tasks") and decision.intent.strip():
+            record_degradation("sub_questions_missing")
+            update["tasks"] = _to_tasks([decision.intent])
         # Any re-run of the pipeline invalidates the previous draft; leaving it in place
         # lets finalize return a report that no longer matches the analysis.
         if state.get("report"):
@@ -226,6 +249,12 @@ async def finalize(state: ResearchState) -> dict[str, Any]:
     elif not state.get("turn_attempted"):
         # Nothing was researchable in this turn's input; this is guidance, not a failure.
         content = NO_TARGET_HINT
+    elif sources:
+        content = (
+            f"已采集 {len(sources)} 条来源，但本轮未能完成分析，未生成报告。\n\n"
+            f"当前状态：调度轮次 {rounds}。\n"
+            "建议：稍后重试，或缩小问题范围后重新发起。"
+        )
     else:
         content = (
             "本次调研未能采集到可用信息，未生成报告。\n\n"
