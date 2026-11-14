@@ -17,6 +17,7 @@ so two runs can be compared line by line after a prompt or model change.
 import asyncio
 import json
 import logging
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -52,7 +53,8 @@ def load_cases(selection: str | None) -> list[dict]:
 
 
 def estimate_cost(model: str, tokens_in: int, tokens_out: int) -> str:
-    prices = PRICE_PER_MTOK.get(model)
+    # DashScope snapshot suffixes (-1017 etc.) are priced like the base model.
+    prices = PRICE_PER_MTOK.get(model) or PRICE_PER_MTOK.get(re.sub(r"-\d{4}$", "", model))
     if not prices:
         return "—"
     usd = tokens_in / 1e6 * prices[0] + tokens_out / 1e6 * prices[1]
