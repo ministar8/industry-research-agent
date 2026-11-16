@@ -1,0 +1,93 @@
+/* ══════════════════════════════════════════════════════════════
+   研序 · 基础层：设计变量、元素重置、全局元素与无障碍工具类
+   不含任何组件或页面样式；外壳与侧栏见 components.css
+   ══════════════════════════════════════════════════════════════ */
+
+:root {
+  --canvas: #f6f6f6;
+  --panel: #fafafa;
+  --card: #ffffff;
+  --soft: #f2f2f2;
+  --hover: rgb(19 52 59 / .05);
+  --selected: rgb(19 52 59 / .06);
+  --ink: #13343b;
+  --ink-2: #5f6e73;
+  --ink-3: #8a9699;
+  --rule: #e7e7e7;
+  --rule-strong: #d5d5d5;
+  --signal: #13343b;
+  --signal-deep: #0b2126;
+  --flag: #b3261e;
+  --flag-soft: #fbeeec;
+
+  --radius-shell: 16px;
+  --radius-card: 12px;
+  --radius-ctl: 8px;
+
+  --rail: 242px;
+  --src: 292px;
+
+  /* app.js 读取它判断是否为窄屏；媒体查询里不能用变量，改这里要同步改各处的 900px */
+  --bp-mobile: 900px;
+
+  /* 内容列宽度（各视图正文列） */
+  --content-narrow: 616px;
+  --content-mid: 636px;
+  --content-wide: 668px;
+
+  /* 组件尺寸 */
+  --composer-home-h: 118px;
+  --composer-chat-h: 88px;
+  --chat-fade-h: 150px;
+  --search-w: 150px;
+
+  --serif: "Noto Serif SC", "Source Han Serif SC", "Songti SC", Georgia, SimSun, serif;
+  --mono: ui-monospace, "SF Mono", "Cascadia Mono", Consolas, "Liberation Mono", monospace;
+  /* 全站只用这四级字号；首页大标题是唯一例外 */
+  --fs-caption: 12px;
+  --fs-small: 13px;
+  --fs-body: 15px;
+  --fs-title: 20px;
+  --ease: cubic-bezier(.2, .7, .2, 1);
+}
+@media (max-width: 1100px) {
+  :root { --src: 264px; --rail: 224px; }
+}
+
+/* ── 重置 ─────────────────────────────────────────────── */
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html, body { height: 100%; }
+body {
+  margin: 0; overflow: hidden;
+  background: var(--canvas); color: var(--ink);
+  font: 400 var(--fs-body)/1.7 var(--serif);
+  -webkit-font-smoothing: antialiased;
+}
+h1, h2, h3, h4, p, ul, ol, dl, dd, dt { margin: 0; }
+a { color: inherit; text-decoration: none; }
+button { font: inherit; color: inherit; border: 0; background: none; cursor: pointer; padding: 0; }
+button:disabled { cursor: not-allowed; opacity: .5; }
+input, textarea, select { font: inherit; color: inherit; }
+svg { display: block; flex: none; }
+[data-icon] { display: inline-flex; align-items: center; justify-content: center; flex: none; }
+:focus-visible { outline: 2px solid var(--signal); outline-offset: 2px; }
+
+/* ── 全局元素 ─────────────────────────────────────────── */
+code { font: 400 var(--fs-caption)/1.7 var(--mono); background: var(--soft); border-radius: 4px; padding: 1px 5px; }
+select { flex: none; min-width: 108px; height: 34px; padding: 0 8px; border: 1px solid var(--rule-strong); border-radius: var(--radius-ctl); background: var(--card); font-size: var(--fs-small); }
+.table-scroll { overflow-x: auto; margin: 6px 0 16px; }
+table { border-collapse: collapse; width: 100%; font-size: var(--fs-small); }
+th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--rule); vertical-align: top; }
+th { color: var(--ink-3); font-weight: 500; background: var(--soft); font-size: var(--fs-caption); white-space: nowrap; }
+td { font-variant-numeric: tabular-nums; }
+tbody tr:hover { background: var(--panel); }
+
+/* ── 工具类 ───────────────────────────────────────────── */
+.muted { color: var(--ink-3); }
+.sr-only, .skip-link:not(:focus) { position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+.skip-link:focus { position: fixed; z-index: 100; top: 12px; left: 12px; padding: 10px 14px; background: var(--ink); color: #fff; border-radius: var(--radius-ctl); }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation: none !important; transition: none !important; }
+}

@@ -1,7 +1,7 @@
 [project]
 name = "industry-research-agent"
 version = "0.1.0"
-description = "Multi-agent industry and competitive intelligence research service built with LangGraph, FastAPI and Streamlit"
+description = "Multi-agent industry and competitive intelligence research service built with LangGraph and FastAPI"
 readme = "README.md"
 authors = [{ name = "Billy Jean" }]
 classifiers = [
@@ -33,7 +33,6 @@ dependencies = [
     "pydantic-settings ~=2.16.0",
     "python-dotenv ~=1.2.2",
     "setuptools>=84.0,<84.2",
-    "streamlit ~=1.66.0",
     "uvicorn ~=0.54.0",
 ]
 
@@ -41,9 +40,6 @@ dependencies = [
 # pinned uv version (older uv ignores this and strips it from uv.lock on re-lock).
 [tool.uv]
 exclude-newer = "14 days"
-
-[tool.uv.exclude-newer-package]
-streamlit = "0 days"  # 1.66.1 lifts the pillow<13 cap; remove once >14 days old
 
 [dependency-groups]
 dev = [
@@ -53,19 +49,19 @@ dev = [
     "pytest-cov",
     "pytest-env",
     "pytest-asyncio",
+    "playwright",
     "ruff ~=0.15.21",
     "pyrefly ~=1.4.0",
     "pymarkdownlnt",
 ]
 
-# Group for the minimal dependencies to run just the client and Streamlit app.
+# Group for the minimal dependencies to run just the client.
 # These are also installed in the default dependencies.
 # To install run: `uv sync --frozen --only-group client`
 client = [
     "httpx~=0.28.1",
     "pydantic ~=2.14.1",
     "python-dotenv ~=1.2.2",
-    "streamlit~=1.66.0",
 ]
 
 [tool.ruff]
@@ -99,7 +95,6 @@ plugins.md024.siblings_only = true
 
 [tool.pyrefly]
 project-includes = ["src"]
-project-excludes = ["src/streamlit_app.py"]
 preset = "default"
 
 [tool.pyrefly.errors]

@@ -1,6 +1,9 @@
+name: industry-research-agent
+
 services:
   postgres:
     image: postgres:16
+    restart: unless-stopped
     ports:
       - "5432:5432"
     environment:
@@ -23,11 +26,17 @@ services:
       - "8080:8080"
     env_file:
       - .env
+    # .env is written for host runs, where the DB is localhost. Inside the compose
+    # network it is the service name; environment takes precedence over env_file.
+    environment:
+      - POSTGRES_HOST=postgres
     depends_on:
       postgres:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/info"]
+      # python:slim ships no curl. /health sits outside the bearer-auth router, so the
+      # probe keeps working once AUTH_SECRET is set.
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health', timeout=3)"]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -51,32 +60,5 @@ services:
         - path: src/memory/
           action: sync+restart
           target: /app/memory/
-  streamlit_app:
-    build:
-      context: .
-      dockerfile: docker/Dockerfile.app
-    ports:
-      - "8501:8501"
-    depends_on:
-      - agent_service
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8501/healthz"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-    environment:
-      - AGENT_URL=http://agent_service:8080
-    develop:
-      watch:
-        - path: src/client/
-          action: sync+restart
-          target: /app/client/
-        - path: src/schema/
-          action: sync+restart
-          target: /app/schema/
-        - path: src/streamlit_app.py
-          action: sync+restart
-          target: /app/streamlit_app.py
-
 volumes:
   postgres_data:

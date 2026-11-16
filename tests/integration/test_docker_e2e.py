@@ -1,5 +1,4 @@
 import pytest
-from streamlit.testing.v1 import AppTest
 
 from client import AgentClient
 
@@ -15,24 +14,3 @@ def test_service_with_fake_model():
     assert response.type == "ai"
     # research-supervisor parses intent; off-topic input hits the no-target hint, not an echo.
     assert response.content.startswith("没能从这段输入里识别出可调研的对象")
-
-
-@pytest.mark.docker
-def test_service_with_app():
-    """Test the service using the app.
-
-    This test requires the service container to be running with USE_FAKE_MODEL=true
-    """
-    at = AppTest.from_file("../../src/streamlit_app.py").run()
-    assert at.chat_message[0].avatar == "assistant"
-    welcome = at.chat_message[0].markdown[0].value
-    assert welcome.startswith("我是行业与竞品调研助手")
-    assert not at.exception
-
-    at.sidebar.selectbox[1].set_value("research-supervisor")
-    at.chat_input[0].set_value("What is the weather in Tokyo?").run()
-    assert at.chat_message[0].avatar == "user"
-    assert at.chat_message[0].markdown[0].value == "What is the weather in Tokyo?"
-    assert at.chat_message[1].avatar == "assistant"
-    assert at.chat_message[1].markdown[0].value.startswith("没能从这段输入里识别出可调研的对象")
-    assert not at.exception

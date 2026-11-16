@@ -26,9 +26,8 @@ def pytest_collection_modifyitems(config, items):
 def mock_env():
     """Fixture to ensure environment is clean for each test.
 
-    Streamlit resolves its config directory from the user's home directory, so the
-    OS-level variables it needs are preserved: clearing them makes the script run
-    crash before it can report a result.
+    OS-level variables are preserved: clearing them makes some scripts crash
+    before they can report a result.
     """
     preserved = {
         key: value

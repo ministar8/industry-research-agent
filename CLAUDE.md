@@ -24,8 +24,7 @@
   comparable only when the model id in `summary.md` matches. The checks are deterministic
   (constraints recorded, format, anchors, exclusions, source count, sections); they do
   **not** measure analysis quality — read one saved report before claiming improvement.
-- Run: `uv run python src/run_service.py` (:8080) and
-  `uv run streamlit run src/streamlit_app.py` (:8501). PostgreSQL must be running first:
+- Run: `uv run python src/run_service.py` (:8080). PostgreSQL must be running first:
   `docker compose up -d postgres`.
 
 ## Conventions
@@ -103,7 +102,5 @@ Provider and measurement facts that are not derivable from the code. Check them 
   `set_event_loop_policy`; psycopg's async mode refuses it. `run_service.py` builds
   `uvicorn.Server` manually with `asyncio.SelectorEventLoop`. That path has **no hot
   reload**. Do not revert it to `uvicorn.run(...)`.
-- There is no git repository. Nothing here can be rolled back; `git init` plus a baseline
-  commit is a prerequisite, not a nicety.
 - `PRICE_PER_MTOK` has no entry for `deepseek-v4.1-flash-1017`, so the eval cost column
   shows `—`. Do not invent a price.

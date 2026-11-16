@@ -16,5 +16,6 @@ COPY src/memory/ ./memory/
 COPY src/schema/ ./schema/
 COPY src/service/ ./service/
 COPY src/run_service.py .
+COPY static/ /static/
 
 CMD ["python", "run_service.py"]

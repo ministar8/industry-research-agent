@@ -2,7 +2,7 @@
 
 面向行业研究与竞品分析的**多智能体协作服务**。一个调度主控加三个专职子智能体，共享同一份调研状态，最终产出带引用锚点、可追溯来源的结构化报告。
 
-技术栈：LangGraph（编排）+ FastAPI（服务）+ Streamlit（界面）+ DeepSeek V4.1-Flash（百炼托管，关闭思考）+ DeepSeek Search/Fetch（检索）。语音输入输出为可选项，走 OpenAI STT/TTS，仅在 Streamlit 端生效。
+技术栈：LangGraph（编排）+ FastAPI（服务）+ 静态展示页（HTML / CSS / 原生 JS）+ DeepSeek V4.1-Flash（百炼托管，关闭思考）+ DeepSeek Search/Fetch（检索）。服务对外提供 REST 与 SSE API；`static/` 是可独立部署的纯静态项目展示页。
 
 ## 设计原则
 
@@ -64,12 +64,9 @@ uv sync
 
 # 3. 启动服务
 uv run python src/run_service.py
-
-# 4. 另开终端启动界面
-uv run streamlit run src/streamlit_app.py
 ```
 
-服务默认监听 `http://0.0.0.0:8080`，界面在 `http://localhost:8501`。界面默认连接本机 `127.0.0.1:8080`，服务不在本机时用 `AGENT_URL` 指定。界面侧栏可切换模型、浏览历史会话，并支持可选的语音输入与朗读（见[语音](#语音可选)）。
+服务默认监听 `http://0.0.0.0:8080`，对外提供 `/info`、`/invoke`、`/stream`、`/history`、`/threads` 等端点。项目展示页位于 `static/`，是零依赖的纯静态文件，可直接部署到 Cloudflare Pages 等静态托管，不需要后端参与。
 
 无需真实 API key 也可以验证链路连通性：
 
@@ -141,8 +138,7 @@ src/
 ├── service/                  # service.py（路由与鉴权）、agui.py、threads.py、utils.py
 ├── client/                   # 通用 AgentClient，同步与异步两套调用
 ├── evaluation/               # 评估用确定性评分器
-├── voice/                    # 可选语音：stt.py / tts.py 工厂、manager.py、providers/
-├── streamlit_app.py          # 聊天界面
+├── voice/                    # 可选语音底层：stt.py / tts.py 工厂、providers/
 ├── run_service.py            # 启动服务
 ├── run_agent.py              # 命令行直接运行图
 └── run_client.py             # 客户端用法示例
@@ -157,16 +153,17 @@ src/
 | `memory/` | 三套持久化后端 | 切换只改 `DATABASE_TYPE`，业务代码不感知 |
 | `schema/` | 对外协议模型 | 服务端、客户端、界面共用同一套定义 |
 | `evaluation/` | 评估判据 | 只做确定性结构检查，不评判分析质量 |
-| `voice/` | STT/TTS 抽象与 provider | 客户端能力，服务端不感知 |
+| `voice/` | STT/TTS 抽象与 provider | 可独立使用，服务端不感知；当前无界面集成 |
 
 仓库其他目录：
 
 ```text
+static/    # 纯静态项目展示页（HTML / CSS / JS），可独立部署到静态托管
 evals/     # 5 个用例、评分脚本、Writer A/B 脚本与 runs/ 历史记录
-tests/     # pytest，按包分层，含 app / service 的端到端与 smoke 持久化用例
+tests/     # pytest，按包分层，含 service 的端到端与 smoke 持久化用例
 scripts/   # ab_bench.py、AG-UI 演示客户端（Node）
 docs/      # AG-UI 接入说明、文件式凭据说明
-docker/    # 服务端与界面镜像、Mongo 专用 compose
+docker/    # 服务端镜像、Mongo 专用 compose
 ```
 
 ## 开发
@@ -178,7 +175,7 @@ uv run pyrefly check
 uv run pytest
 ```
 
-`tests/` 与 `src/` 的包一一对应（agents / app / client / core / evaluation / schema / service / voice），
+`tests/` 与 `src/` 的包一一对应（agents / client / core / evaluation / schema / service / voice），
 另有 `tests/integration` 与 `tests/smoke` 两组需要运行中服务的用例，默认跳过，加 `--run-docker` 才执行
 （这两个目录复用 `USE_FAKE_MODEL=true` 与服务端配置，`smoke` 还会校验 checkpoint 确实落到当前
 `DATABASE_TYPE` 对应的后端）。
@@ -230,19 +227,16 @@ Windows 上硬编码 Proactor。`run_service.py` 已在「Windows + PostgreSQL�
 
 ## 语音（可选）
 
-语音是**客户端能力**，只在 Streamlit 界面生效：音频在浏览器端录、由 `voice/` 转成文本后，仍走普通的
-`/stream` 调用，服务端对它无感知。
+`voice/` 提供可独立使用的 STT / TTS 抽象与 OpenAI provider 实现，不依赖界面框架，服务端对它无感知。当前项目没有界面集成，留作后续接入使用。
 
 | 变量 | 作用 | 当前支持 |
 |---|---|---|
 | `VOICE_STT_PROVIDER` | 语音识别 | 仅 `openai`（`deepgram` 有类型定义，调用会抛 `NotImplementedError`） |
 | `VOICE_TTS_PROVIDER` | 语音合成 | 仅 `openai`（`elevenlabs` 同上） |
 
-- 两者留空即关闭；`VoiceManager.from_env()` 返回 `None`，界面自动回落到纯文本输入，朗读按钮置灰并提示去配 `.env`。
-- `SpeechToText` / `TextToSpeech` 可以脱离 Streamlit 单独使用，`manager.py` 只负责把二者接到
-  `st.chat_input(accept_audio=True)` 和消息渲染上。
-- 转写结果直接作为用户输入文本进入会话；TTS 音频存放在 `st.session_state` 供重跑时复用，不写磁盘。
-- provider 初始化失败只记日志并降级，不会让界面起不来——语音是能少不能崩的旁路。
+- 两者留空即关闭。
+- `SpeechToText` / `TextToSpeech` 可单独使用，各自通过环境变量选择 provider。
+- provider 初始化失败只记日志并降级，不会让服务起不来——语音是能少不能崩的旁路。
 
 ## 评估
 

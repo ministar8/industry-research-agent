@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="行业与竞品调研工作台。发起调研、核对报告来源，查看真实评估记录。">
+  <meta name="color-scheme" content="light">
+  <title>研序 · 行业与竞品调研</title>
+  <link rel="icon" type="image/svg+xml" href="favicon.svg">
+  <link rel="stylesheet" href="css/base.css">
+  <link rel="stylesheet" href="css/components.css">
+  <link rel="stylesheet" href="css/views.css">
+</head>
+<body>
+  <a class="skip-link" href="#mainContent">跳到主要内容</a>
+  <div class="app-shell">
+    <button class="rail-icon mobile-menu" id="menuToggle" aria-label="查看记录与会话" aria-expanded="false" aria-controls="sidebar">
+      <span data-icon="panel-left"></span>
+    </button>
+    <div class="app-grid">
+      <aside class="rail" id="sidebar" role="dialog" aria-modal="true" aria-label="工作区导航">
+        <div class="rail-top">
+          <a class="brand" href="#home" aria-label="研序首页">
+            <span class="brand-symbol" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20.2h16"></path><path d="M6.8 16.6v-7.2"></path><path d="M12 16.6V4.6"></path><path d="M17.2 16.6v-4.6"></path></svg>
+            </span>
+            <span class="brand-text">研序</span>
+          </a>
+          <a class="rail-icon" href="#about" aria-label="关于本项目"><span data-icon="circle-help"></span></a>
+        </div>
+
+
+
+        <button class="new-button" id="newResearch" data-nav="home"><span data-icon="plus"></span>新建调研</button>
+
+        <nav class="primary-nav" aria-label="主要导航">
+          <a href="#data" data-nav="data"><span data-icon="chart-column"></span>数据总览</a>
+          <a href="#records" data-nav="records"><span data-icon="files"></span>调研档案</a>
+        </nav>
+
+        <div id="historySection">
+          <div class="sidebar-section"><span>最近</span></div>
+          <nav class="record-nav" id="historyNav" aria-label="最近会话"><p class="field-help">连接服务后显示最近会话。</p></nav>
+        </div>
+
+        <div class="sidebar-bottom">
+          <button class="connection-button" id="openConnection"><span class="status-dot"></span><span id="connectionLabel">连接调研服务</span></button>
+        </div>
+      </aside>
+      <button class="sidebar-scrim" id="sidebarScrim" aria-label="关闭导航" hidden></button>
+
+      <div class="workspace" id="workspace">
+        <main id="mainContent" class="panel" tabindex="-1">
+          <section id="homeView" class="view home-view" aria-labelledby="homeTitle">
+            <div class="home-hero">
+              <div class="home-hero-inner">
+                <div class="home-intro">
+                  <span class="hero-mark" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20.2h16"></path><path d="M6.8 16.6v-7.2"></path><path d="M12 16.6V4.6"></path><path d="M17.2 16.6v-4.6"></path></svg>
+                  </span>
+                  <h1 id="homeTitle">You’re here!</h1>
+                </div>
+                <div id="homeComposer"></div>
+                <div class="home-cards">
+                  <button type="button" class="home-card" data-prompt="0"><span class="home-card-title"><span data-icon="chart-column"></span>梳理行业格局</span><span class="home-card-desc">市场规模、头部排名与价格走势。</span></button>
+                  <button type="button" class="home-card" data-prompt="1"><span class="home-card-title"><span data-icon="search"></span>研究细分市场</span><span class="home-card-desc">新兴模式的市场空间与主要参与者。</span></button>
+                  <button type="button" class="home-card" data-prompt="2"><span class="home-card-title"><span data-icon="files"></span>对比竞品布局</span><span class="home-card-desc">多家企业的产能与战略逐项对照。</span></button>
+                  <button type="button" class="home-card" data-prompt="3"><span class="home-card-title"><span data-icon="book-open"></span>追踪技术路线</span><span class="home-card-desc">国产替代进展、卡点与代表企业。</span></button>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <section id="dataView" class="view data-view" hidden aria-labelledby="dataTitle">
+            <div class="page-heading">
+              <div><h1 id="dataTitle">数据总览</h1><p class="muted" id="dataSubtitle"></p></div>
+              <button class="button" id="exportData"><span data-icon="download"></span>导出 CSV</button>
+            </div>
+            <div class="summary-grid" id="summaryMetrics"></div>
+            <div class="data-charts">
+              <section class="chart-panel"><div class="section-title"><h2>调研耗时</h2><span class="muted">秒 / 用例</span></div><div id="durationChart" class="bar-chart"></div></section>
+              <section class="chart-panel"><div class="section-title"><h2>模型用量</h2><span class="muted">输入 / 输出 token</span></div><div id="tokenChart" class="bar-chart"></div><div class="chart-legend"><span><i class="legend-input"></i>输入</span><span><i class="legend-output"></i>输出</span></div></section>
+            </div>
+            <section class="records-panel" aria-labelledby="recordsTitle">
+              <div class="records-toolbar">
+                <h2 id="recordsTitle">评估明细</h2>
+                <div class="filters">
+                  <label class="search-field"><span data-icon="search"></span><input id="recordSearch" type="search" placeholder="搜索调研对象" aria-label="搜索调研对象"></label>
+                  <select id="recordFilter" aria-label="筛选记录类型"><option value="all">全部记录</option><option value="research">调研用例</option><option value="negative">负样本</option></select>
+                </div>
+              </div>
+              <div class="table-scroll" tabindex="0" role="region" aria-label="评估明细表">
+                <table class="records-table">
+                  <caption class="sr-only">评估明细表</caption>
+                  <thead><tr><th scope="col">调研对象</th><th scope="col">结构判据</th><th scope="col"><button id="sortDuration" class="table-sort">耗时<span data-icon="arrow-down-up"></span></button></th><th scope="col">来源条数</th><th scope="col">模型调用</th><th scope="col">LLM 成本</th><th scope="col"><span class="sr-only">操作</span></th></tr></thead>
+                  <tbody id="recordsBody"></tbody>
+                </table>
+              </div>
+              <p class="table-footer" id="tableFooter"></p>
+            </section>
+            <div class="data-notes" id="dataNotes"></div>
+          </section>
+
+          <section id="recordsView" class="view records-view" hidden aria-labelledby="recordsPageTitle">
+            <div class="page-heading">
+              <div><h1 id="recordsPageTitle">调研档案</h1><p class="muted" id="recordsSubtitle"></p></div>
+            </div>
+            <ol class="archive-list" id="archiveList"></ol>
+          </section>
+
+          <section id="reportView" class="view report-view" hidden aria-label="调研档案">
+            <div class="report-toolbar">
+              <a href="#data" class="text-button"><span data-icon="arrow-left"></span>返回记录</a>
+              <div class="button-group">
+                <button class="button" id="exportReport"><span data-icon="download"></span>导出报告</button>
+              </div>
+            </div>
+            <div class="report-layout">
+              <div class="report-main">
+                <article class="report-paper">
+                  <header class="report-heading">
+                    <h1 class="signature" id="reportTitle"></h1>
+                    <div class="report-meta" id="reportMeta"></div>
+                  </header>
+                  <div class="markdown" id="reportBody"></div>
+                </article>
+                <details class="detail-panel"><summary>查看原始问题与调研约束<span data-icon="chevron-down"></span></summary><div id="reportContext"></div></details>
+                <details class="detail-panel"><summary>查看运行数据与结构判据<span data-icon="chevron-down"></span></summary><div id="reportChecks"></div></details>
+              </div>
+              <aside class="source-panel" aria-labelledby="sourcesTitle">
+                <div class="section-title"><h2 id="sourcesTitle">来源</h2><span id="sourceCount" class="count-chip"></span></div>
+                <p class="section-description">点击正文编号，定位对应来源。</p>
+                <ol class="source-list" id="reportSources"></ol>
+              </aside>
+            </div>
+          </section>
+
+          <section id="chatView" class="view chat-view" hidden aria-label="调研会话">
+            <div class="chat-main">
+              <header class="chat-head">
+                <span id="chatTitle">调研会话</span>
+                <span class="caret" data-icon="chevron-down"></span>
+                <div class="head-actions"><button class="rail-icon" id="chatMenu" aria-label="查看记录与会话"><span data-icon="panel-left"></span></button></div>
+              </header>
+              <div id="chatMessages" class="chat-messages" aria-live="polite" aria-relevant="additions"></div>
+              <div id="chatComposer" class="chat-composer"></div>
+              <p class="chat-disclaimer">报告由模型生成，请结合原始来源核对结论</p>
+            </div>
+            <aside class="chat-sources-panel" aria-labelledby="chatSourcesTitle">
+              <div class="src-panel-head"><h2 id="chatSourcesTitle">来源</h2><span class="count" id="chatSourceCount"></span></div>
+              <div class="src-panel-body"><ol class="source-list" id="chatSources"><li class="src-empty">发起一次调研后，引用的来源会按站点归到这里。</li></ol></div>
+            </aside>
+          </section>
+
+          <section id="aboutView" class="view about-view" hidden aria-labelledby="aboutTitle">
+            <div class="page-heading"><div><h1 id="aboutTitle">让结论有据可查</h1><p class="muted">行业与竞品调研多智能体服务，基于 LangGraph 与 FastAPI。</p></div></div>
+            <div id="aboutSections"></div>
+            <p class="muted" id="aboutRun"></p>
+          </section>
+
+          <form id="composer" class="composer">
+            <label for="question" class="sr-only">调研问题</label>
+            <textarea id="question" rows="2" maxlength="20000" placeholder="描述对象、时间口径和关注的问题…"></textarea>
+            <div class="composer-footer">
+              <div class="composer-tools">
+                <button class="composer-tool" id="composerAdd" type="button" aria-label="新建调研" title="新建调研">
+                  <span data-icon="plus"></span>
+                </button>
+                <button class="composer-tool" id="composerAttach" type="button" aria-label="附加档案" title="附加档案（暂未开放）">
+                  <span data-icon="paperclip"></span>
+                </button>
+              </div>
+              <div class="composer-actions">
+                <button class="send-button" id="sendQuestion" type="submit" aria-label="开始调研" title="开始调研"><span data-icon="arrow-up"></span></button>
+                <button class="send-button stop-button" id="stopWaiting" type="button" aria-label="停止等待" title="停止等待" hidden><span data-icon="square"></span></button>
+              </div>
+            </div>
+          </form>
+          <span class="sr-only" id="pageTitle">新建调研</span>
+        </main>
+      </div>
+    </div>
+  </div>
+
+  <dialog id="connectionDialog" class="connection-dialog" aria-labelledby="connectionTitle">
+    <form id="connectionForm">
+      <div class="section-title"><h2 id="connectionTitle">连接调研服务</h2><button class="rail-icon" id="closeConnection" type="button" aria-label="关闭连接设置"><span data-icon="x"></span></button></div>
+      <p class="muted">使用同源 FastAPI 服务。连接只读取服务信息，不发起调研。</p>
+      <label for="serviceOrigin">服务地址</label><input id="serviceOrigin" readonly>
+      <label for="serviceToken">访问口令 <span class="muted">（未配置鉴权时留空）</span></label><input id="serviceToken" type="password" autocomplete="off" placeholder="填写服务的 AUTH_SECRET">
+      <p class="field-help">口令仅保存在当前页面内存，不写入浏览器存储。模型 API 密钥始终留在后端。</p>
+      <div id="connectionResult" class="connection-result" role="status"></div>
+      <div class="dialog-actions"><button class="button" id="disconnectService" type="button" hidden>断开连接</button><button class="button primary" id="connectService" type="submit">连接服务</button></div>
+    </form>
+  </dialog>
+  <div class="toast" id="toast" role="status" aria-live="polite" aria-atomic="true" hidden></div>
+  <noscript><p>请启用 JavaScript 以查看调研记录。</p></noscript>
+  <script type="module" src="js/app.js"></script>
+
+
+</body>
+</html>

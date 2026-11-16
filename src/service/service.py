@@ -4,6 +4,7 @@ import logging
 import warnings
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Annotated, Any
 from uuid import UUID, uuid4
 
@@ -11,6 +12,7 @@ from fastapi import APIRouter, Depends, FastAPI, HTTPException, status
 from fastapi.responses import StreamingResponse
 from fastapi.routing import APIRoute
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from fastapi.staticfiles import StaticFiles
 from langchain_core._api import LangChainBetaWarning
 from langchain_core.messages import (
     AIMessage,
@@ -494,3 +496,8 @@ async def health_check():
 
 
 app.include_router(router)
+app.mount(
+    "/ui",
+    StaticFiles(directory=Path(__file__).resolve().parents[2] / "static", html=True),
+    name="ui",
+)
