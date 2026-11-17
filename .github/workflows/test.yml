@@ -70,21 +70,6 @@ jobs:
   test-docker:
     runs-on: ubuntu-latest
 
-    services:
-      dind:
-        image: docker:dind
-        ports:
-          - 2375:2375
-          # The service runs as an unprivileged user on --network host, so it cannot
-          # bind ports below 1024 (the host netns keeps ip_unprivileged_port_start=1024).
-          - 8000:8000
-        options: >-
-          --privileged
-          --health-cmd "docker info"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-
     steps:
       - uses: actions/checkout@v7
 
