@@ -43,7 +43,7 @@ def get_agent(agent_id: str) -> AgentGraph:
 
     # If it's a lazy loading agent, ensure it's loaded and return its graph
     if isinstance(agent_graph, LazyLoadingAgent):
-        if not agent_graph._loaded:
+        if not agent_graph.is_loaded:
             raise RuntimeError(f"Agent {agent_id} not loaded. Call load() first.")
         return agent_graph.get_graph()
 

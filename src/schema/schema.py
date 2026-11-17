@@ -38,6 +38,31 @@ class ServiceMetadata(BaseModel):
     )
 
 
+class RegisterInput(BaseModel):
+    """Credentials for creating a user account."""
+
+    username: str = Field(min_length=3, max_length=32)
+    password: str = Field(min_length=8, max_length=128)
+
+
+class LoginInput(RegisterInput):
+    """Credentials for signing in."""
+
+
+class UserResponse(BaseModel):
+    """Public user information."""
+
+    id: str
+    username: str
+    created_at: datetime | None = None
+
+
+class AuthResponse(BaseModel):
+    """Authenticated user returned after a session change."""
+
+    user: UserResponse
+
+
 class UserInput(BaseModel):
     """Basic user input for the agent."""
 
@@ -58,6 +83,10 @@ class UserInput(BaseModel):
         max_length=255,
         examples=["847c6285-8fc9-4560-a83f-4e6285809254"],
     )
+    context_mode: Literal["fresh", "reuse"] = Field(
+        description="Whether the research turn starts fresh or reuses the previous turn's sources.",
+        default="fresh",
+    )
     user_id: str | None = Field(
         description="User ID to persist and continue a conversation across multiple threads.",
         default=None,
@@ -74,7 +103,15 @@ class UserInput(BaseModel):
     @classmethod
     def validate_agent_config(cls, value: dict[str, Any]) -> dict[str, Any]:
         # Validate before StreamingResponse sends headers or any checkpoint is read.
-        reserved_keys = {"thread_id", "user_id", "model", "checkpoint_id", "checkpoint_ns"}
+        reserved_keys = {
+            "thread_id",
+            "turn_id",
+            "context_mode",
+            "user_id",
+            "model",
+            "checkpoint_id",
+            "checkpoint_ns",
+        }
         if overlap := reserved_keys & value.keys():
             raise ValueError(f"agent_config contains reserved keys: {sorted(overlap)}")
         return value
@@ -186,6 +223,11 @@ class ChatHistoryInput(BaseModel):
         max_length=255,
         examples=["847c6285-8fc9-4560-a83f-4e6285809254"],
     )
+    user_id: str | None = Field(
+        description="User ID that owns the thread.",
+        default=None,
+        max_length=255,
+    )
 
 
 class ChatHistory(BaseModel):
@@ -195,8 +237,9 @@ class ChatHistory(BaseModel):
 class UserThreadsInput(BaseModel):
     """Input for listing a user's conversation threads."""
 
-    user_id: str = Field(
+    user_id: str | None = Field(
         description="User ID to list threads for.",
+        default=None,
         max_length=255,
         examples=["847c6285-8fc9-4560-a83f-4e6285809254"],
     )

@@ -9,13 +9,20 @@ from langchain_core.messages import AIMessage, AnyMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, Field, model_validator
 
+from agents.research_team.contracts import (
+    ResearchSubject,
+    ResearchTask,
+)
 from agents.research_team.helpers import (
     dedupe_sources,
     resolve_model,
     source_appendix,
     structured_output,
 )
-from agents.research_team.state import NextAction, ResearchState, ResearchTask
+from agents.research_team.state import (
+    NextAction,
+    ResearchState,
+)
 from core import settings
 from core.metrics import record_degradation
 
@@ -59,7 +66,9 @@ SUPERVISOR_PROMPT = """你是行业与竞品调研团队的调度中枢。你不
 - 分析为空时不得选择 writer。
 - 子问题必须具体到可直接检索，且必须锚定用户提到的调研对象。
   正面：「2025 年中国换电重卡销量与主要运营商份额」；反面：「了解一下换电」。
+- 研究对象必须单独列出，覆盖用户提到的全部主要对象，并为每个对象提供稳定 ID 和别名。
 - 子问题数量 1-4 个，需覆盖用户提到的全部主要对象，不要遗漏后文才提到的对象。
+- 对比问题必须保留一个同时涉及双方的比较子问题，不能只生成单方任务。
 - 哪怕整段输入只有一句与调研相关，也要抓住它继续调研，不要因为夹杂无关内容就选择 finalize。
 - 只有当整段输入确实找不到任何可调研对象时，才选择 finalize。"""
 
@@ -69,6 +78,9 @@ class RoutingDecision(BaseModel):
     is_research: bool = Field(description="是否包含需要外部信息的调研需求")
     sub_questions: list[str] = Field(
         description="拆解出的可独立回答的子问题，调研轮 1-4 个，非调研轮给空列表"
+    )
+    subjects: list[ResearchSubject] = Field(
+        description="本轮研究对象，必须覆盖用户提到的主要对象；非调研轮为空列表"
     )
     constraints: list[str] = Field(description="必须保真的范围限定与交付要求，没有则空列表")
     next: NextAction = Field(description="下一步的路由目标")
@@ -82,28 +94,54 @@ class RoutingDecision(BaseModel):
         if isinstance(data, dict):
             data.setdefault("sub_questions", [])
             data.setdefault("constraints", [])
+            data.setdefault("subjects", [])
         return data
 
 
 def _status_block(state: ResearchState) -> str:
     sources = dedupe_sources(state.get("sources"))
     tasks = state.get("tasks") or []
+    subjects = state.get("subjects") or []
     task_lines = "\n".join(f"- [{t.id}] {t.question}" for t in tasks) or "（无）"
+    subject_lines = (
+        "\n".join(
+            f"- [{subject.id}] {subject.name}（别名：{'、'.join(subject.aliases) or '无'}）"
+            for subject in subjects
+        )
+        or "（无）"
+    )
     constraint_lines = "\n".join(f"- {c}" for c in state.get("constraints") or []) or "（无）"
+    coverage = state.get("evidence_coverage") or []
+    subject_coverage = state.get("subject_coverage") or []
+    coverage_summary = (
+        "，".join(
+            f"{status} {sum(1 for item in coverage if item.status == status)}"
+            for status in ("sufficient", "partial", "missing", "conflicting")
+            if any(item.status == status for item in coverage)
+        )
+        or "（无）"
+    )
     return f"""当前调研状态：
 - 既有意图：{state.get("intent") or "（无）"}
 - 已拆解任务：
 {task_lines}
+- 已识别研究对象：
+{subject_lines}
 - 交付与范围约束：
 {constraint_lines}
 - 已采集来源：{len(sources)} 条
 - 分析完成：{"是" if state.get("analysis") else "否"}
+- 子问题证据覆盖：{coverage_summary}
+- 对象证据覆盖：{len(subject_coverage)} 条
 - 报告完成：{"是" if state.get("report") else "否"}
 - 已用调度轮次：{state.get("rounds") or 0}/{state.get("max_rounds") or MAX_ROUNDS}"""
 
 
 def _enforce(decision: RoutingDecision, state: ResearchState) -> NextAction:
     """Downgrade decisions that violate the state preconditions."""
+    if not decision.is_research:
+        return "finalize"
+
     has_sources = bool(dedupe_sources(state.get("sources")))
     has_analysis = bool(state.get("analysis"))
     target = decision.next
@@ -119,9 +157,64 @@ def _enforce(decision: RoutingDecision, state: ResearchState) -> NextAction:
     return target
 
 
-def _to_tasks(questions: list[str]) -> list[ResearchTask]:
+def _incoming_turn_id(config: RunnableConfig | None) -> str | None:
+    if not config:
+        return None
+    turn_id = config.get("configurable", {}).get("turn_id")
+    return str(turn_id) if turn_id else None
+
+
+def _context_mode(config: RunnableConfig | None) -> str:
+    if not config:
+        return "fresh"
+    return str(config.get("configurable", {}).get("context_mode") or "fresh")
+
+
+def _is_new_turn(state: ResearchState, config: RunnableConfig | None) -> bool:
+    incoming_turn_id = _incoming_turn_id(config)
+    if incoming_turn_id is not None:
+        return incoming_turn_id != state.get("active_turn_id")
+    return bool(state["messages"]) and state["messages"][-1].type == "human"
+
+
+def _turn_state(state: ResearchState, is_new_turn: bool, context_mode: str) -> ResearchState:
+    if not is_new_turn:
+        return state
+    return {
+        **state,
+        "analysis": "",
+        "report": "",
+        "tasks": [],
+        "subjects": [],
+        "constraints": [],
+        "plan_notes": "",
+        "sources": list(state.get("sources") or []) if context_mode == "reuse" else [],
+        "evidence_coverage": [],
+        "subject_coverage": [],
+        "evidence_statements": [],
+        "rounds": 0,
+        "turn_attempted": False,
+        "abort_reason": "",
+    }
+
+
+def _to_tasks(
+    questions: list[str], subjects: list[ResearchSubject] | None = None
+) -> list[ResearchTask]:
+    subjects = subjects or []
     return [
-        ResearchTask(id=f"T{index}", question=question.strip(), assignee="researcher")
+        ResearchTask(
+            id=f"T{index}",
+            question=question.strip(),
+            assignee="researcher",
+            subject_ids=[
+                subject.id
+                for subject in subjects
+                if subject.name in question
+                or any(alias and alias in question for alias in subject.aliases)
+            ]
+            or ([subjects[0].id] if len(subjects) == 1 else []),
+        )
         for index, question in enumerate(questions, start=1)
         if question.strip()
     ]
@@ -133,22 +226,36 @@ def _fake_decision() -> RoutingDecision:
         is_research=False,
         sub_questions=[],
         constraints=[],
+        subjects=[],
         next="finalize",
         reason="USE_FAKE_MODEL 已启用，仅验证链路连通性",
     )
 
 
 async def supervisor(state: ResearchState, config: RunnableConfig) -> dict[str, Any]:
+    is_new_turn = _is_new_turn(state, config)
+    context_mode = _context_mode(config)
+    turn_state = _turn_state(state, is_new_turn, context_mode)
+    # A bare abort marker can exist on the first request in tests or restored state;
+    # only a state with a prior turn may use the human message to clear it.
+    has_prior_turn = bool(
+        state.get("rounds")
+        or state.get("turn_attempted")
+        or state.get("report")
+        or state.get("analysis")
+    )
+    if state.get("abort_reason") and not has_prior_turn:
+        is_new_turn = False
+        turn_state = state
     # A rejected retrieval is already terminal; asking the model to route again just
     # buys another call that must end in finalize.
-    if state.get("abort_reason"):
+    if state.get("abort_reason") and not is_new_turn:
         return {"next_action": "finalize"}
 
-    rounds = (state.get("rounds") or 0) + 1
-    max_rounds = state.get("max_rounds") or MAX_ROUNDS
-    # rounds is thread-scoped; the last message being human marks the first pass of a
-    # new turn, which is where per-turn bookkeeping has to be reset.
-    is_new_turn = bool(state["messages"]) and state["messages"][-1].type == "human"
+    rounds = (turn_state.get("rounds") or 0) + 1
+    max_rounds = turn_state.get("max_rounds") or MAX_ROUNDS
+    # rounds is scoped to the active turn; the last message being human is only the
+    # compatibility fallback when a caller does not provide a turn_id.
 
     if settings.USE_FAKE_MODEL:
         decision = _fake_decision()
@@ -158,31 +265,70 @@ async def supervisor(state: ResearchState, config: RunnableConfig) -> dict[str, 
             model, RoutingDecision, "supervisor", max_tokens=ROUTING_MAX_TOKENS
         )
         messages: list[AnyMessage] = [
-            SystemMessage(content=SUPERVISOR_PROMPT + "\n\n" + _status_block(state))
+            SystemMessage(content=SUPERVISOR_PROMPT + "\n\n" + _status_block(turn_state))
         ]
         messages.extend(state["messages"][-12:])
         decision = await decider.ainvoke(messages)
 
-    target = "finalize" if rounds > max_rounds else _enforce(decision, state)
+    target = "finalize" if rounds > max_rounds else _enforce(decision, turn_state)
 
     update: dict[str, Any] = {
         "intent": decision.intent,
         "next_action": target,
         "rounds": rounds,
         "plan_notes": decision.reason,
-        "turn_attempted": False if is_new_turn else bool(state.get("turn_attempted")),
+        "turn_attempted": False if is_new_turn else bool(turn_state.get("turn_attempted")),
     }
 
+    incoming_turn_id = _incoming_turn_id(config)
+    if is_new_turn:
+        update.update(
+            {
+                "analysis": "",
+                "report": "",
+                "tasks": [],
+                "subjects": [],
+                "sources": list(turn_state.get("sources") or []),
+                "evidence_coverage": [],
+                "subject_coverage": [],
+                "evidence_statements": [],
+                "abort_reason": "",
+            }
+        )
+    if incoming_turn_id is not None:
+        update["active_turn_id"] = incoming_turn_id
+        update["active_context_mode"] = context_mode
+
+    if is_new_turn:
+        update["abort_reason"] = ""
+
     if target in {"researcher", "analyst", "writer"}:
-        if decision.sub_questions:
-            update["tasks"] = _to_tasks(decision.sub_questions)
-        elif target == "researcher" and not state.get("tasks") and decision.intent.strip():
-            record_degradation("sub_questions_missing")
-            update["tasks"] = _to_tasks([decision.intent])
+        if is_new_turn:
+            update["subjects"] = list(decision.subjects)
+            if decision.sub_questions:
+                update["tasks"] = _to_tasks(decision.sub_questions, decision.subjects)
+            elif target == "researcher":
+                record_degradation("sub_questions_missing")
+                update["tasks"] = (
+                    _to_tasks([decision.intent], decision.subjects)
+                    if decision.intent.strip()
+                    else []
+                )
+        elif not turn_state.get("tasks") and decision.sub_questions:
+            update["tasks"] = _to_tasks(decision.sub_questions, turn_state.get("subjects") or [])
         # Any re-run of the pipeline invalidates the previous draft; leaving it in place
         # lets finalize return a report that no longer matches the analysis.
-        if state.get("report"):
+        if turn_state.get("report"):
             update["report"] = ""
+        if target == "researcher":
+            # New sources invalidate the previous task-to-evidence mapping. Analyst
+            # will rebuild it after the additional retrieval round.
+            update["evidence_coverage"] = []
+            update["subject_coverage"] = []
+    elif is_new_turn:
+        # finalize() prefers staged output over its no-target guidance.
+        update["report"] = ""
+        update["analysis"] = ""
 
     # A later round re-parses the same input and may under-report constraints; merging
     # within a turn keeps the verbatim set intact. A new turn starts fresh so the
@@ -190,7 +336,7 @@ async def supervisor(state: ResearchState, config: RunnableConfig) -> dict[str, 
     if is_new_turn:
         update["constraints"] = list(dict.fromkeys(decision.constraints))
     else:
-        merged = list(state.get("constraints") or [])
+        merged = list(turn_state.get("constraints") or [])
         merged += [c for c in decision.constraints if c not in merged]
         update["constraints"] = merged
 

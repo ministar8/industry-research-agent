@@ -2,12 +2,15 @@
 
 import asyncio
 import logging
+import math
+from collections.abc import Mapping
 from typing import Any
 
 from langchain_core.messages import AIMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, Field
 
+from agents.research_team.contracts import Source
 from agents.research_team.helpers import (
     clean_title,
     clean_url,
@@ -17,10 +20,10 @@ from agents.research_team.helpers import (
     structured_output,
     url_key,
 )
-from agents.research_team.search import SearchRejected, fetch, search
-from agents.research_team.state import ResearchState, Source
+from agents.research_team.search import SearchRejected, fetch, is_fetchable, search
+from agents.research_team.state import ResearchState
 from core import settings
-from core.metrics import record_degradation, record_fetch, record_search
+from core.metrics import record_degradation, record_fetch, record_filter, record_search
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +76,14 @@ class SourceJudgements(BaseModel):
 def _task_brief(state: ResearchState) -> str:
     tasks = state.get("tasks") or []
     questions = "\n".join(f"- {t.question}" for t in tasks) or "- （未拆解，按用户原问题检索）"
+    subjects = state.get("subjects") or []
+    subject_lines = (
+        "\n".join(
+            f"- {subject.name}（别名：{'、'.join(subject.aliases) or '无'}）"
+            for subject in subjects
+        )
+        or "- （未单独识别）"
+    )
     constraints = "\n".join(f"- {c}" for c in state.get("constraints") or []) or "（无）"
     known = dedupe_sources(state.get("sources"))
     known_urls = "\n".join(f"- {s.url}" for s in known[-15:]) or "（无）"
@@ -85,6 +96,9 @@ def _task_brief(state: ResearchState) -> str:
     return f"""本轮意图：{state.get("intent") or "（未解析）"}
 待调研子问题：
 {questions}
+
+研究对象（每个主要对象都必须覆盖）：
+{subject_lines}
 
 必须遵守的范围与交付约束：
 {constraints}
@@ -183,8 +197,34 @@ async def _judge(
         )
 
 
-def _candidate(item: dict[str, Any], query: str) -> dict[str, Any]:
-    authority = item.get("authority")
+def _safe_score(item: Mapping[str, Any], field: str, default: int | float) -> int | float:
+    value = item.get(field)
+    if value is None:
+        return default
+    try:
+        if isinstance(value, bool):
+            raise ValueError
+        number = float(value)
+        if not math.isfinite(number):
+            raise ValueError
+        if field == "authority":
+            if not number.is_integer() or not -1 <= number <= 4:
+                raise ValueError
+            return int(number)
+        if not 0 <= number <= 3:
+            raise ValueError
+        return number
+    except (TypeError, ValueError):
+        logger.warning("Ignoring invalid Search %s field of type %s", field, type(value).__name__)
+        record_degradation("search_result_invalid_field")
+        return default
+
+
+def _candidate(item: Any, query: str) -> dict[str, Any] | None:
+    if not isinstance(item, Mapping):
+        logger.warning("Skipping Search result with type %s", type(item).__name__)
+        record_degradation("search_result_invalid_item")
+        return None
     return {
         "url": clean_url(str(item.get("url") or "")),
         "title": clean_title(str(item.get("title") or "")),
@@ -192,10 +232,70 @@ def _candidate(item: dict[str, Any], query: str) -> dict[str, Any]:
         "summary": str(item.get("summary") or ""),
         "site_name": str(item.get("site_name") or ""),
         "published_at": str(item.get("date") or ""),
-        "authority": int(authority) if authority is not None else -1,
-        "rerank_score": float(item.get("rerank_score") or 0.0),
+        "authority": _safe_score(item, "authority", -1),
+        "rerank_score": _safe_score(item, "rerank_score", 0.0),
         "query": query,
     }
+
+
+def _filter_candidates(
+    batches: list[tuple[str, list[Any]]], known_sources: list[Source]
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """Remove only structurally unusable or duplicate Search results.
+
+    Quality scores are deliberately not consulted here; relevance remains the
+    Judge's responsibility and score-derived confidence is assigned unchanged.
+    """
+    counts = {
+        "invalid_item": 0,
+        "invalid_url": 0,
+        "empty_content": 0,
+        "duplicate": 0,
+        "over_limit": 0,
+    }
+    candidates: list[dict[str, Any]] = []
+    seen = {url_key(source.url) for source in known_sources if url_key(source.url)}
+    for query, batch in batches:
+        for item in batch:
+            candidate = _candidate(item, query)
+            if candidate is None:
+                counts["invalid_item"] += 1
+                continue
+            if not is_fetchable(candidate["url"]):
+                counts["invalid_url"] += 1
+                continue
+            if not any(candidate[field].strip() for field in ("title", "summary", "snippet")):
+                counts["empty_content"] += 1
+                continue
+            key = url_key(candidate["url"])
+            if not key or key in seen:
+                counts["duplicate"] += 1
+                continue
+            seen.add(key)
+            candidates.append(candidate)
+
+    if len(candidates) > MAX_CANDIDATES:
+        counts["over_limit"] = len(candidates) - MAX_CANDIDATES
+        candidates.sort(
+            key=lambda candidate: (candidate["rerank_score"], candidate["authority"]),
+            reverse=True,
+        )
+        candidates = candidates[:MAX_CANDIDATES]
+    return candidates, counts
+
+
+def _filter_note(counts: dict[str, int], raw_count: int, candidate_count: int) -> str:
+    labels = {
+        "invalid_item": "结构无效",
+        "invalid_url": "URL 无效",
+        "empty_content": "内容为空",
+        "duplicate": "重复",
+        "over_limit": "超出限额",
+    }
+    details = "，".join(f"{labels[key]} {value} 条" for key, value in counts.items() if value)
+    return f"候选过滤：原始 {raw_count} 条，去重并限额后交给 Judge {candidate_count} 条" + (
+        f"（{details}）" if details else ""
+    )
 
 
 def _to_source(candidate: dict[str, Any]) -> Source:
@@ -227,9 +327,13 @@ async def _deep_read(sources: list[Source]) -> int:
     fetched = 0
     for source, page in zip(targets, pages, strict=True):
         if isinstance(page, BaseException):
-            logger.warning("Fetch failed for %s: %s", source.url, page)
-            record_fetch(ok=False)
-            continue
+            if isinstance(page, asyncio.CancelledError):
+                raise page
+            if isinstance(page, Exception):
+                logger.warning("Fetch failed for %s: %s", source.url, page)
+                record_fetch(ok=False)
+                continue
+            raise page
         if not page:
             continue
         source.content = page["content"][:MAX_CONTENT_CHARS]
@@ -250,34 +354,47 @@ async def researcher(state: ResearchState, config: RunnableConfig) -> dict[str, 
 
     failures = 0
     rejected = 0
-    candidates: list[dict[str, Any]] = []
-    seen: set[str] = set()
+    batches_for_filter: list[tuple[str, list[Any]]] = []
     for query, batch in zip(queries, batches, strict=True):
         if isinstance(batch, BaseException):
-            failures += 1
-            if isinstance(batch, SearchRejected):
-                rejected += 1
-            logger.warning("Search failed for %r: %s", query, batch)
-            record_search(ok=False)
-            continue
-        for item in batch:
-            candidate = _candidate(item, query)
-            key = url_key(candidate["url"])
-            if not key or key in seen:
+            if isinstance(batch, asyncio.CancelledError):
+                raise batch
+            if isinstance(batch, Exception):
+                failures += 1
+                if isinstance(batch, SearchRejected):
+                    rejected += 1
+                logger.warning("Search failed for %r: %s", query, batch)
+                record_search(ok=False)
                 continue
-            seen.add(key)
-            candidates.append(candidate)
+            raise batch
+        batches_for_filter.append((query, batch))
 
-    candidates.sort(key=lambda c: c["rerank_score"], reverse=True)
-    candidates = candidates[:MAX_CANDIDATES]
+    raw_count = sum(len(batch) for _, batch in batches_for_filter)
+    candidates, filter_counts = _filter_candidates(batches_for_filter, state.get("sources") or [])
+    for reason, count in filter_counts.items():
+        record_filter(reason, count)
+    filter_note = _filter_note(filter_counts, raw_count, len(candidates))
 
     if not candidates:
+        if raw_count == 0 and failures:
+            outcome = "未返回结果"
+        elif raw_count == 0:
+            outcome = "空结果"
+        elif (
+            filter_counts["invalid_item"]
+            + filter_counts["invalid_url"]
+            + filter_counts["empty_content"]
+            == raw_count
+        ):
+            outcome = "全无效"
+        elif filter_counts["duplicate"] == raw_count:
+            outcome = "全重复"
+        else:
+            outcome = "过滤后无可用结果"
         detail = f"（{failures} 条查询调用失败）" if failures else ""
         update: dict[str, Any] = {
             "turn_attempted": True,
-            "messages": [
-                AIMessage(content=f"本轮检索未返回结果{detail}，将尝试重新拆解查询条件。")
-            ],
+            "messages": [AIMessage(content=f"本轮检索{outcome}{detail}。{filter_note}")],
         }
         if rejected and rejected == len(queries):
             # Every query was refused, so the next round would fail identically.
@@ -301,11 +418,11 @@ async def researcher(state: ResearchState, config: RunnableConfig) -> dict[str, 
     failure_note = f"，{failures} 条查询失败" if failures else ""
     summary = (
         f"检索完成：执行 {len(queries)} 条查询{failure_note}，保留 {kept} 条来源"
-        f"（平均可信度 {average:.2f}），深读 {fetched} 篇正文。\n"
-        + "\n".join(f"- [{s.title or s.url}]({s.url})" for s in collected[:5])
+        f"（平均来源评分 {average:.2f}），深读 {fetched} 篇正文。\n"
+        f"{filter_note}\n" + "\n".join(f"- [{s.title or s.url}]({s.url})" for s in collected[:5])
     )
     return {
-        "sources": collected,
+        "sources": dedupe_sources([*(state.get("sources") or []), *collected]),
         "turn_attempted": True,
         "messages": [AIMessage(content=summary)],
     }

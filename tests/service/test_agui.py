@@ -194,6 +194,103 @@ def test_agui_configurable_passthrough(mock_agui_agent, allow_fake_model, test_c
     assert captured_configurable.get("user_id") == "user-123"
 
 
+def test_agui_rejects_invalid_context_mode(mock_agui_agent, test_client) -> None:
+    body = run_input(forwardedProps={"configurable": {"context_mode": "unknown"}})
+
+    response = test_client.post("/agui/model-agent/run", json=body)
+
+    assert response.status_code == 422
+    assert "context_mode" in response.json()["detail"]
+
+
+def test_agui_jwt_identity_overrides_client_user_id(
+    monkeypatch, mock_agui_agent, test_client
+) -> None:
+    """With JWT auth the session identity wins over a client-asserted user_id."""
+    from uuid import uuid4
+
+    from pydantic import SecretStr
+
+    from auth.security import issue_access_token
+    from auth.store import AuthUser
+    from service import app
+
+    user_id = uuid4()
+    monkeypatch.setattr(settings, "JWT_SECRET", SecretStr("test-secret"))
+
+    class Store:
+        async def get_user(self, uid):
+            return AuthUser(user_id, "alice", 0) if uid == user_id else None
+
+    monkeypatch.setattr(app.state, "auth_store", Store(), raising=False)
+    test_client.cookies.set("access_token", issue_access_token(user_id, "alice", 0))
+
+    body = run_input(
+        thread_id="jwt-identity-thread",
+        forwardedProps={"configurable": {"user_id": "victim"}},
+    )
+    collect_events(test_client, "/agui/model-agent/run", body)
+
+    assert captured_configurable.get("user_id") == str(user_id)
+    tup = model_agent.checkpointer.get_tuple(
+        RunnableConfig(configurable={"thread_id": "jwt-identity-thread"})
+    )
+    assert tup is not None
+    assert tup.metadata["user_id"] == str(user_id)
+
+
+def test_agui_rejects_thread_owned_by_another_user(mock_agui_agent, test_client) -> None:
+    """Ownership is checked before SSE headers: the caller gets a real 404, not a cut stream."""
+    body = run_input(
+        thread_id="owned-thread",
+        forwardedProps={"configurable": {"user_id": "user-123"}},
+    )
+    collect_events(test_client, "/agui/model-agent/run", body)
+
+    intruder = run_input(
+        thread_id="owned-thread",
+        forwardedProps={"configurable": {"user_id": "user-456"}},
+    )
+    response = test_client.post("/agui/model-agent/run", json=intruder)
+
+    assert response.status_code == 404
+    assert response.headers["content-type"].startswith("application/json")
+
+
+def test_agui_jwt_user_cannot_open_another_users_thread(
+    monkeypatch, mock_agui_agent, test_client
+) -> None:
+    from uuid import uuid4
+
+    from pydantic import SecretStr
+
+    from auth.security import issue_access_token
+    from auth.store import AuthUser
+    from service import app
+
+    collect_events(
+        test_client,
+        "/agui/model-agent/run",
+        run_input(
+            thread_id="victim-thread", forwardedProps={"configurable": {"user_id": "victim"}}
+        ),
+    )
+
+    user_id = uuid4()
+    monkeypatch.setattr(settings, "JWT_SECRET", SecretStr("test-secret"))
+
+    class Store:
+        async def get_user(self, uid):
+            return AuthUser(user_id, "alice", 0) if uid == user_id else None
+
+    monkeypatch.setattr(app.state, "auth_store", Store(), raising=False)
+    test_client.cookies.set("access_token", issue_access_token(user_id, "alice", 0))
+
+    response = test_client.post("/agui/model-agent/run", json=run_input(thread_id="victim-thread"))
+
+    assert response.status_code == 404
+
+
 def test_agui_records_thread_metadata(mock_agui_agent, test_client) -> None:
     """AG-UI runs record user_id/agent_id so their threads are listed by /threads."""
     body = run_input(

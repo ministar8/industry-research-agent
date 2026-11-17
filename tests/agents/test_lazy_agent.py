@@ -1,5 +1,6 @@
 """Tests for the LazyLoadingAgent base class."""
 
+import asyncio
 from unittest.mock import Mock
 
 import pytest
@@ -13,12 +14,8 @@ class LazyLoadingAgentFixture(LazyLoadingAgent):
     def __init__(self):
         super().__init__()
 
-    async def load(self) -> None:
+    async def _load(self):
         """Test load implementation."""
-        self._loaded = True
-
-    def _create_graph(self):
-        """Test graph creation."""
         mock_graph = Mock()
         mock_graph.name = "test-graph"
         return mock_graph
@@ -30,7 +27,7 @@ class TestLazyLoadingAgentBase:
     def test_initialization(self):
         """Test that agent initializes correctly."""
         agent = LazyLoadingAgentFixture()
-        assert not agent._loaded
+        assert not agent.is_loaded
         assert agent._graph is None
 
     @pytest.mark.asyncio
@@ -38,7 +35,23 @@ class TestLazyLoadingAgentBase:
         """Test that load works correctly."""
         agent = LazyLoadingAgentFixture()
         await agent.load()
-        assert agent._loaded
+        assert agent.is_loaded
+        assert agent.get_graph().name == "test-graph"
+
+    @pytest.mark.asyncio
+    async def test_load_is_idempotent(self):
+        agent = LazyLoadingAgentFixture()
+        await agent.load()
+        graph = agent.get_graph()
+        await agent.load()
+        assert agent.get_graph() is graph
+
+    @pytest.mark.asyncio
+    async def test_concurrent_load_creates_one_graph(self):
+        agent = LazyLoadingAgentFixture()
+        await asyncio.gather(agent.load(), agent.load())
+        assert agent.is_loaded
+        assert agent.get_graph().name == "test-graph"
 
     def test_get_graph_before_load(self):
         """Test that get_graph raises error before load."""

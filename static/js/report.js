@@ -1,6 +1,6 @@
 /* 调研档案：档案列表页与报告详情页 */
 import { $, esc, icons, download } from './ui.js';
-import { DATA, label } from './data.js';
+import { EVALUATION_SNAPSHOT, label } from './evaluation-data.js';
 import { parseAnswer, markdown, sourceGroups } from './answer.js';
 
 let current = null;
@@ -27,8 +27,8 @@ function checkLabel(name) {
 }
 
 function renderArchive() {
-  $('recordsSubtitle').textContent = `${DATA.cases.length} 份 · 评估批次 ${DATA.run.date} · 模型 ${DATA.run.model}`;
-  $('archiveList').innerHTML = DATA.cases.map((c, i) => {
+  $('recordsSubtitle').textContent = `${EVALUATION_SNAPSHOT.cases.length} 份 · 评估批次 ${EVALUATION_SNAPSHOT.run.date} · 模型 ${EVALUATION_SNAPSHOT.run.model}`;
+  $('archiveList').innerHTML = EVALUATION_SNAPSHOT.cases.map((c, i) => {
     const [title, kind] = label(c);
     return `<li><a class="archive-row" href="#record/${encodeURIComponent(c.id)}">
       <span class="archive-index">${String(i + 1).padStart(2, '0')}</span>
@@ -46,7 +46,7 @@ export function renderRecord(record) {
   current = record;
   const { report, sources } = parseAnswer(record.answer);
   $('reportTitle').textContent = label(record)[0];
-  $('reportMeta').innerHTML = [`${DATA.run.date} · 评估记录`, `${record.source_count} 条来源`, `${record.elapsed} 秒`, `LLM ${record.cost}`].map((s) => `<span>${esc(s)}</span>`).join('');
+  $('reportMeta').innerHTML = [`${EVALUATION_SNAPSHOT.run.date} · 评估记录`, `${record.source_count} 条来源`, `${record.elapsed} 秒`, `LLM ${record.cost}`].map((s) => `<span>${esc(s)}</span>`).join('');
   $('reportBody').innerHTML = markdown(report, sources, 'record');
   $('reportSources').innerHTML = sourceGroups(sources, 'record', '此记录未采集来源。');
   $('sourceCount').textContent = sources.length;

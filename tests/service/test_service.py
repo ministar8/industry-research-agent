@@ -165,7 +165,10 @@ def test_invoke_custom_agent_config(test_client, mock_agent) -> None:
 @pytest.mark.parametrize(
     "endpoint", ["/invoke", "/stream", "/custom_agent/invoke", "/custom_agent/stream"]
 )
-@pytest.mark.parametrize("key", ["thread_id", "user_id", "model", "checkpoint_id", "checkpoint_ns"])
+@pytest.mark.parametrize(
+    "key",
+    ["thread_id", "turn_id", "context_mode", "user_id", "model", "checkpoint_id", "checkpoint_ns"],
+)
 @pytest.mark.parametrize("value", ["override", "", None])
 def test_agent_config_rejects_reserved_keys(test_client, mock_agent, endpoint, key, value) -> None:
     response = test_client.post(
@@ -287,6 +290,26 @@ def test_history(test_client, mock_agent) -> None:
     assert output.messages[0].content == QUESTION
     assert output.messages[1].type == "ai"
     assert output.messages[1].content == ANSWER
+
+
+def test_history_rejects_a_thread_owned_by_another_user(test_client, mock_agent) -> None:
+    mock_agent.aget_state.return_value = StateSnapshot(
+        values={"messages": []},
+        next=(),
+        config={},
+        metadata={"user_id": "alice", "agent_id": "research-supervisor"},
+        created_at=None,
+        parent_config=None,
+        tasks=(),
+        interrupts=(),
+    )
+
+    response = test_client.post(
+        "/history",
+        json={"thread_id": "shared-thread", "user_id": "bob"},
+    )
+
+    assert response.status_code == 404
 
 
 def test_history_custom_agent(test_client) -> None:
@@ -546,6 +569,118 @@ def test_invoke_metrics_use_generated_thread_id(test_client, mock_agent, caplog)
     assert len(lines) == 1
     assert f"thread={resolved}" in lines[0]
     assert "thread=-" not in lines[0]
+
+
+def test_invoke_passes_a_server_generated_turn_id(test_client, mock_agent) -> None:
+    mock_agent.ainvoke.return_value = [("values", {"messages": [AIMessage(content="ok")]})]
+
+    response = test_client.post("/invoke", json={"message": "hi", "thread_id": "thread-1"})
+
+    assert response.status_code == 200
+    configurable = mock_agent.ainvoke.await_args.kwargs["config"]["configurable"]
+    assert configurable["thread_id"] == "thread-1"
+    assert configurable["turn_id"]
+
+
+def test_invoke_rejects_a_thread_owned_by_another_user(test_client, mock_agent) -> None:
+    mock_agent.aget_state.return_value = StateSnapshot(
+        values={"messages": []},
+        next=(),
+        config={},
+        metadata={"user_id": "alice", "agent_id": "research-supervisor"},
+        created_at=None,
+        parent_config=None,
+        tasks=(),
+        interrupts=(),
+    )
+
+    response = test_client.post(
+        "/invoke",
+        json={"message": "继续研究", "thread_id": "shared-thread", "user_id": "bob"},
+    )
+
+    assert response.status_code == 404
+    mock_agent.ainvoke.assert_not_awaited()
+
+
+def test_invoke_passes_context_mode(test_client, mock_agent) -> None:
+    mock_agent.ainvoke.return_value = [("values", {"messages": [AIMessage(content="ok")]})]
+
+    response = test_client.post("/invoke", json={"message": "重新分析", "context_mode": "reuse"})
+
+    assert response.status_code == 200
+    configurable = mock_agent.ainvoke.await_args.kwargs["config"]["configurable"]
+    assert configurable["context_mode"] == "reuse"
+
+
+def _jwt_client(monkeypatch):
+    """A client whose requests look like a trusted proxy forwarded public HTTPS."""
+    from uuid import uuid4
+
+    from fastapi.testclient import TestClient
+    from pydantic import SecretStr
+
+    from auth.security import issue_access_token
+    from auth.store import AuthUser
+    from service import app
+
+    user_id = uuid4()
+    monkeypatch.setattr(settings, "JWT_SECRET", SecretStr("test-secret"))
+
+    class Store:
+        async def get_user(self, uid):
+            return AuthUser(user_id, "alice", 0) if uid == user_id else None
+
+    monkeypatch.setattr(app.state, "auth_store", Store(), raising=False)
+    client = TestClient(app, base_url="https://testserver")
+    client.cookies.set("access_token", issue_access_token(user_id, "alice", 0))
+    return client
+
+
+def test_jwt_cookie_post_allows_matching_origin(monkeypatch, mock_agent) -> None:
+    client = _jwt_client(monkeypatch)
+
+    response = client.post(
+        "/invoke", json={"message": "hi"}, headers={"Origin": "https://testserver"}
+    )
+
+    assert response.status_code == 200
+
+
+def test_jwt_cookie_post_rejects_cross_origin(monkeypatch, mock_agent) -> None:
+    client = _jwt_client(monkeypatch)
+
+    response = client.post(
+        "/invoke", json={"message": "hi"}, headers={"Origin": "https://evil.example"}
+    )
+
+    assert response.status_code == 403
+    mock_agent.ainvoke.assert_not_awaited()
+
+
+def test_threads_without_user_id_returns_422(test_client, mock_agent) -> None:
+    mock_agent.checkpointer = object()
+
+    response = test_client.get("/threads")
+
+    assert response.status_code == 422
+    assert "user_id" in response.json()["detail"]
+
+
+def test_runtime_metrics_prefers_the_persistent_turn_store(monkeypatch, test_client) -> None:
+    from service import app
+
+    class Store:
+        async def recent(self, user_id=None, limit=200):
+            assert user_id is None
+            return [{"thread_id": "persisted-turn", "status": "ok"}]
+
+    monkeypatch.setattr(app.state, "turn_store", Store(), raising=False)
+
+    response = test_client.get("/runtime-metrics")
+
+    assert response.status_code == 200
+    assert response.json()["turns"] == [{"thread_id": "persisted-turn", "status": "ok"}]
 
 
 @pytest.mark.asyncio

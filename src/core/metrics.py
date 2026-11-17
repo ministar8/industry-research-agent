@@ -11,9 +11,11 @@ writes made inside a node are visible to the caller that opened the turn.
 """
 
 import logging
+from collections import deque
 from collections.abc import Mapping
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from time import perf_counter
 from typing import Any
 
@@ -23,7 +25,11 @@ logger = logging.getLogger(__name__)
 @dataclass
 class TurnMetrics:
     thread_id: str = "-"
-    started_at: float = field(default_factory=perf_counter)
+    user_id: str = "-"
+    model: str = "-"
+    query_summary: str = ""
+    started_at: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
+    started_perf: float = field(default_factory=perf_counter)
     llm_calls: int = 0
     input_tokens: int = 0
     output_tokens: int = 0
@@ -34,8 +40,33 @@ class TurnMetrics:
     fetch_failed: int = 0
     fetch_skipped: int = 0
     degradations: list[str] = field(default_factory=list)
+    filter_counts: dict[str, int] = field(default_factory=dict)
+    sources_count: int = 0
+    report_title: str = ""
+    error_detail: str = ""
     # Per-node attribution: {"judge": {"calls": 1, "in": 9000, "out": 600}, ...}
     calls: dict[str, dict[str, int]] = field(default_factory=dict)
+
+    def snapshot(self, status: str) -> dict[str, Any]:
+        return {
+            "thread_id": self.thread_id,
+            "status": status,
+            "started_at": self.started_at,
+            "finished_at": datetime.now(UTC).isoformat(),
+            "model": self.model,
+            "query_summary": self.query_summary,
+            "report_title": self.report_title,
+            "sources_count": self.sources_count,
+            "error_detail": self.error_detail,
+            "elapsed": round(perf_counter() - self.started_perf, 1),
+            "llm_calls": self.llm_calls,
+            "tokens_in": self.input_tokens,
+            "tokens_out": self.output_tokens,
+            "search_calls": self.search_calls,
+            "fetch_calls": self.fetch_calls,
+            "search_failed": self.search_failed,
+            "fetch_failed": self.fetch_failed,
+        }
 
     def record_usage(self, usage: Mapping[str, Any] | None, label: str = "-") -> None:
         self.llm_calls += 1
@@ -60,7 +91,7 @@ class TurnMetrics:
             "fetch_failed=%d fetch_skipped=%d degraded=%s",
             thread,
             status,
-            perf_counter() - self.started_at,
+            perf_counter() - self.started_perf,
             self.llm_calls,
             self.input_tokens,
             self.output_tokens,
@@ -72,6 +103,11 @@ class TurnMetrics:
             self.fetch_skipped,
             ",".join(self.degradations) or "-",
         )
+        if self.filter_counts:
+            logger.info(
+                "turn source_filters=%s",
+                ",".join(f"{key}={value}" for key, value in sorted(self.filter_counts.items())),
+            )
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
                 "turn breakdown %s",
@@ -83,18 +119,77 @@ class TurnMetrics:
 
 
 _current: ContextVar[TurnMetrics | None] = ContextVar("turn_metrics", default=None)
+RECENT_LIMIT = 200
+_recent: deque[dict[str, Any]] = deque(maxlen=RECENT_LIMIT)
+_sink: Any | None = None
 
 
-def begin_turn(thread_id: str | None = None) -> Token[TurnMetrics | None]:
+def set_turn_sink(sink: Any | None) -> None:
+    """Register the durable turn store (memory.turns); None keeps runs in-process only."""
+    global _sink
+    _sink = sink
+
+
+def begin_turn(
+    thread_id: str | None = None,
+    user_id: str | None = None,
+    model: str | None = None,
+    query: str | None = None,
+) -> Token[TurnMetrics | None]:
     """Open a collector for one request. Pair with `end_turn` in a `finally`."""
-    return _current.set(TurnMetrics(thread_id=thread_id or "-"))
+    query_summary = " ".join((query or "").split())
+    if len(query_summary) > 200:
+        query_summary = query_summary[:197] + "..."
+    return _current.set(
+        TurnMetrics(
+            thread_id=thread_id or "-",
+            user_id=user_id or "-",
+            model=model or "-",
+            query_summary=query_summary,
+        )
+    )
 
 
-def end_turn(token: Token[TurnMetrics | None], status: str = "ok") -> None:
+def record_result(
+    *,
+    sources_count: int | None = None,
+    report_title: str | None = None,
+    error: BaseException | None = None,
+) -> None:
+    metrics = _current.get()
+    if metrics is None:
+        return
+    if sources_count is not None:
+        metrics.sources_count = max(0, sources_count)
+    if report_title:
+        normalized = " ".join(report_title.split())
+        metrics.report_title = normalized.removeprefix("# ").strip()[:300]
+    if error is not None:
+        detail = f"{type(error).__name__}: {' '.join(str(error).split())}"
+        metrics.error_detail = detail[:500]
+
+
+async def end_turn(token: Token[TurnMetrics | None], status: str = "ok") -> None:
     metrics = _current.get()
     if metrics is not None:
+        snapshot = {"user_id": metrics.user_id, **metrics.snapshot(status)}
+        _recent.append(snapshot)
+        if _sink is not None:
+            try:
+                await _sink.append(snapshot)
+            except Exception:
+                logger.exception("Failed to persist turn metrics")
         metrics.emit(status)
     _current.reset(token)
+
+
+def recent_turns(user_id: str | None = None) -> list[dict[str, Any]]:
+    """Return recent real service runs, optionally restricted to one user."""
+    return [
+        {key: value for key, value in item.items() if key != "user_id"}
+        for item in reversed(_recent)
+        if user_id is None or item["user_id"] == user_id
+    ]
 
 
 def record_usage(usage: Mapping[str, Any] | None, label: str = "-") -> None:
@@ -145,3 +240,10 @@ def record_degradation(reason: str) -> None:
     metrics = _current.get()
     if metrics is not None and reason not in metrics.degradations:
         metrics.degradations.append(reason)
+
+
+def record_filter(reason: str, count: int = 1) -> None:
+    """Record how many Search candidates were removed before relevance judging."""
+    metrics = _current.get()
+    if metrics is not None and count > 0:
+        metrics.filter_counts[reason] = metrics.filter_counts.get(reason, 0) + count

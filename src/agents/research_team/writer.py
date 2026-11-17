@@ -8,6 +8,7 @@ from langchain_core.messages import AIMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, Field, create_model
 
+from agents.research_team.contracts import SubjectEvidenceCoverage
 from agents.research_team.helpers import (
     clamp_anchors,
     dedupe_sources,
@@ -24,11 +25,12 @@ logger = logging.getLogger(__name__)
 WRITER_PROMPT = """你是行业与竞品调研团队的撰稿人。输入是结构化的分析结果与来源编号表，
 你负责产出一份可直接交付的调研报告。
 
-报告结构（固定四段，不得增删）：
+报告结构（固定五段，不得增删）：
 1. 摘要：3-5 句话讲清结论，包含最关键的数字。
-2. 主要发现：3-6 条，每条一句话结论 + 支撑数据。
-3. 分析：解释发现背后的机制、竞争格局或趋势。
-4. 结论：给出可执行的判断或建议，并诚实标注不确定性。
+2. 对象证据完整度：先说明各研究对象的证据是否对称，以及关键缺口。
+3. 主要发现：3-6 条，每条一句话结论 + 支撑数据。
+4. 分析：解释发现背后的机制、竞争格局或趋势。
+5. 结论：给出可执行的判断或建议，并诚实标注不确定性。
 
 硬性要求：
 - 每个关键事实后必须保留来源锚点 [n]，n 必须来自给定的来源编号表。
@@ -37,6 +39,10 @@ WRITER_PROMPT = """你是行业与竞品调研团队的撰稿人。输入是结�
 - 若约束要求「表格」：把对比数据填进 tables 字段（title / headers / rows），由系统渲染。
   不要在 summary / findings / analysis 里手写 Markdown 表格，也不得用项目符号列表代替。
 - 若约束明确不要表格：tables 留空，用项目符号呈现。
+- 不得把一个对象的证据代表另一个对象；对象证据不足时，必须在摘要或结论中明确说明。
+- 证据类型区块是趋势强度的唯一依据：point 只能写离散事实，change 只能写期间变化，
+  trend 才能写趋势；planned/forecast 必须使用“计划/预计/目标”等限定词。
+- 不得从事实列表自行把单点拼成趋势；结构化证据不足时使用“现有来源不足以确认趋势”。
 - 不得使用「据我所知」「一般来说」这类无来源的表述。
 - 直接成文，不要先列提纲，也不要复述思考过程。
 - 报告正文不得出现元文本：不写自检清单、交付说明、字段说明，也不提及「来源编号表」「给定来源」
@@ -131,17 +137,114 @@ def _cell(value: object) -> str:
     return str(value).replace("|", "\\|").replace("\n", " ").strip()
 
 
-def render_report(bundle: ReportBundle, source_count: int) -> str:
+def _coverage_brief(state: ResearchState) -> str:
+    coverage = state.get("evidence_coverage") or []
+    if not coverage:
+        return "（未生成子问题证据覆盖判断）"
+    lines = []
+    for item in coverage:
+        sources = "".join(f"[{index}]" for index in item.source_indices) or "无"
+        gaps = "；".join(item.gaps) or "无"
+        lines.append(
+            f"- [{item.task_id}] {item.question}：{item.status}；"
+            f"证据强度 {item.evidence_strength}；支持来源 {sources}；信息缺口：{gaps}"
+        )
+    return "\n".join(lines)
+
+
+def _subject_coverage_brief(state: ResearchState) -> str:
+    coverage = state.get("subject_coverage") or []
+    if not coverage:
+        return "（未生成对象证据覆盖判断）"
+    lines = []
+    for item in coverage:
+        aspects = (
+            "；".join(f"{aspect.name}:{aspect.status}" for aspect in item.aspects) or "未生成维度"
+        )
+        gaps = "；".join(item.gaps) or "无"
+        sources = "".join(f"[{index}]" for index in item.source_indices) or "无"
+        lines.append(
+            f"- [{item.subject_id}] {item.subject}：{item.status}；"
+            f"证据强度 {item.evidence_strength}；维度 {aspects}；"
+            f"来源 {sources}；缺口：{gaps}；理由：{item.reason}"
+        )
+    return "\n".join(lines)
+
+
+def _evidence_statements_brief(state: ResearchState) -> str:
+    statements = state.get("evidence_statements") or []
+    if not statements:
+        return "（未生成结构化证据陈述；不得自行推断趋势）"
+    lines = []
+    for item in statements:
+        periods = "、".join(item.periods) or item.period or "未标明时间"
+        sources = "".join(f"[{index}]" for index in item.source_indices) or "无"
+        origin = (
+            "来源明确表述" if item.trend_origin == "explicit_source_statement" else "结构化证据"
+        )
+        lines.append(
+            f"- {item.kind}；时期 {periods}；类型 {item.value_type}；"
+            f"指标 {item.metric or '未标明'}；单位 {item.unit or '未标明'}；"
+            f"{origin}；来源 {sources}：{item.statement}"
+        )
+    return "\n".join(lines)
+
+
+def _render_subject_coverage(coverage: list[SubjectEvidenceCoverage], include_table: bool) -> str:
+    if not coverage:
+        return ""
+    if not include_table:
+        lines = []
+        for item in coverage:
+            aspects = (
+                "、".join(aspect.name for aspect in item.aspects if aspect.status != "missing")
+                or "无"
+            )
+            gaps = "；".join(item.gaps) or "无"
+            lines.append(
+                f"- {item.subject}：状态 {item.status}，已覆盖维度：{aspects}；主要缺口：{gaps}。"
+            )
+        return "## 对象证据完整度\n" + "\n".join(lines)
+
+    rows = []
+    for item in coverage:
+        covered = (
+            "、".join(
+                aspect.name for aspect in item.aspects if aspect.status in {"sufficient", "partial"}
+            )
+            or "无"
+        )
+        gaps = "；".join(item.gaps) or "无"
+        rows.append(f"| {_cell(item.subject)} | {_cell(covered)} | {_cell(gaps)} | {item.status} |")
+    return (
+        "## 对象证据完整度\n"
+        "| 对象 | 已覆盖维度 | 主要缺口 | 状态 |\n"
+        "| --- | --- | --- | --- |\n" + "\n".join(rows)
+    )
+
+
+def render_report(
+    bundle: ReportBundle,
+    source_count: int,
+    subject_coverage: list[SubjectEvidenceCoverage] | None = None,
+    include_subject_table: bool = False,
+) -> str:
     findings = "\n".join(f"- {item}" for item in bundle.findings) or "- 无"
     tables = "\n\n".join(rendered for rendered in map(_render_table, bundle.tables) if rendered)
     findings_section = "## 主要发现\n" + findings + (("\n\n" + tables) if tables else "")
+    subject_section = _render_subject_coverage(subject_coverage or [], include_subject_table)
     body = "\n\n".join(
         [
-            f"# {bundle.title}",
-            "## 摘要\n" + bundle.summary,
-            findings_section,
-            "## 分析\n" + bundle.analysis,
-            "## 结论\n" + bundle.conclusion,
+            item
+            for item in [
+                f"# {bundle.title}",
+                "## 摘要\n" + bundle.summary,
+                subject_section,
+                findings_section,
+                "## 分析\n" + bundle.analysis,
+                "## 结论\n" + bundle.conclusion,
+            ]
+            if item
         ]
     )
     return clamp_anchors(body, source_count)
@@ -206,6 +309,12 @@ async def writer(state: ResearchState, config: RunnableConfig) -> dict[str, Any]
             content=f"调研意图：{state.get('intent') or '（未解析）'}\n\n"
             f"交付与范围约束：\n{constraints}\n\n"
             f"分析结果：\n{analysis}\n\n"
+            "子问题证据覆盖（仅用于校准结论强度，不要原样输出为内部字段）：\n"
+            f"{_coverage_brief(state)}\n\n"
+            "对象证据完整度（必须优先反映对象之间的证据差异）：\n"
+            f"{_subject_coverage_brief(state)}\n\n"
+            "证据类型与允许的结论强度（必须遵守，不得从 prose 重新推断趋势）：\n"
+            f"{_evidence_statements_brief(state)}\n\n"
             f"可用来源编号表：\n{numbered_sources(sources, include_excerpts)}"
         ),
     ]
@@ -216,6 +325,11 @@ async def writer(state: ResearchState, config: RunnableConfig) -> dict[str, Any]
         bundle = await structured.ainvoke([*messages, _COMPLETENESS_REMINDER])
         if not _is_complete(bundle):
             logger.warning("Writer report still incomplete after retry")
-    report = render_report(bundle, len(sources))
+    report = render_report(
+        bundle,
+        len(sources),
+        state.get("subject_coverage") or [],
+        include_subject_table=requires_table(constraints_list),
+    )
 
     return {"report": report, "messages": [AIMessage(content=f"报告已完成：《{bundle.title}》")]}

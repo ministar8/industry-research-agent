@@ -38,6 +38,7 @@ if __name__ == "__main__":
             port=settings.PORT,
             reload=False,
             timeout_graceful_shutdown=settings.GRACEFUL_SHUTDOWN_TIMEOUT,
+            forwarded_allow_ips=settings.FORWARDED_ALLOW_IPS,
         )
         asyncio.run(uvicorn.Server(config).serve(), loop_factory=asyncio.SelectorEventLoop)
     else:
@@ -47,4 +48,5 @@ if __name__ == "__main__":
             port=settings.PORT,
             reload=settings.is_dev(),
             timeout_graceful_shutdown=settings.GRACEFUL_SHUTDOWN_TIMEOUT,
+            forwarded_allow_ips=settings.FORWARDED_ALLOW_IPS,
         )

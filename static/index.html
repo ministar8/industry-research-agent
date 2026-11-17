@@ -35,7 +35,7 @@
 
         <nav class="primary-nav" aria-label="主要导航">
           <a href="#data" data-nav="data"><span data-icon="chart-column"></span>数据总览</a>
-          <a href="#records" data-nav="records"><span data-icon="files"></span>调研档案</a>
+          <a href="#records" data-nav="records"><span data-icon="files"></span>评测快照</a>
         </nav>
 
         <div id="historySection">
@@ -85,14 +85,14 @@
               <div class="records-toolbar">
                 <h2 id="recordsTitle">评估明细</h2>
                 <div class="filters">
-                  <label class="search-field"><span data-icon="search"></span><input id="recordSearch" type="search" placeholder="搜索调研对象" aria-label="搜索调研对象"></label>
-                  <select id="recordFilter" aria-label="筛选记录类型"><option value="all">全部记录</option><option value="research">调研用例</option><option value="negative">负样本</option></select>
+                  <label class="search-field"><span data-icon="search"></span><input id="recordSearch" type="search" placeholder="搜索问题、报告或线程" aria-label="搜索问题、报告或线程"></label>
+                  <select id="recordFilter" aria-label="筛选记录状态"><option value="all">全部记录</option><option value="research">已完成</option><option value="negative">异常或中断</option></select>
                 </div>
               </div>
-              <div class="table-scroll" tabindex="0" role="region" aria-label="评估明细表">
+              <div class="table-scroll" tabindex="0" role="region" aria-label="真实运行记录">
                 <table class="records-table">
-                  <caption class="sr-only">评估明细表</caption>
-                  <thead><tr><th scope="col">调研对象</th><th scope="col">结构判据</th><th scope="col"><button id="sortDuration" class="table-sort">耗时<span data-icon="arrow-down-up"></span></button></th><th scope="col">来源条数</th><th scope="col">模型调用</th><th scope="col">LLM 成本</th><th scope="col"><span class="sr-only">操作</span></th></tr></thead>
+                  <caption class="sr-only">真实运行记录</caption>
+                  <thead><tr><th scope="col">调研</th><th scope="col">状态</th><th scope="col"><button id="sortDuration" class="table-sort">耗时<span data-icon="arrow-down-up"></span></button></th><th scope="col">来源</th><th scope="col">模型调用</th><th scope="col">Token 用量</th><th scope="col"><span class="sr-only">状态</span></th></tr></thead>
                   <tbody id="recordsBody"></tbody>
                 </table>
               </div>
@@ -103,7 +103,7 @@
 
           <section id="recordsView" class="view records-view" hidden aria-labelledby="recordsPageTitle">
             <div class="page-heading">
-              <div><h1 id="recordsPageTitle">调研档案</h1><p class="muted" id="recordsSubtitle"></p></div>
+              <div><h1 id="recordsPageTitle">评测快照</h1><p class="muted" id="recordsSubtitle"></p></div>
             </div>
             <ol class="archive-list" id="archiveList"></ol>
           </section>
@@ -187,8 +187,11 @@
       <div class="section-title"><h2 id="connectionTitle">连接调研服务</h2><button class="rail-icon" id="closeConnection" type="button" aria-label="关闭连接设置"><span data-icon="x"></span></button></div>
       <p class="muted">使用同源 FastAPI 服务。连接只读取服务信息，不发起调研。</p>
       <label for="serviceOrigin">服务地址</label><input id="serviceOrigin" readonly>
-      <label for="serviceToken">访问口令 <span class="muted">（未配置鉴权时留空）</span></label><input id="serviceToken" type="password" autocomplete="off" placeholder="填写服务的 AUTH_SECRET">
-      <p class="field-help">口令仅保存在当前页面内存，不写入浏览器存储。模型 API 密钥始终留在后端。</p>
+      <label for="authMode">登录方式</label><select id="authMode"><option value="login">登录</option><option value="register">注册</option></select>
+      <label for="authUsername">用户名</label><input id="authUsername" autocomplete="username" minlength="3" maxlength="32">
+      <label for="authPassword">密码</label><input id="authPassword" type="password" autocomplete="current-password" minlength="8" maxlength="128">
+      <details><summary>使用旧版服务口令</summary><label for="serviceToken">访问口令</label><input id="serviceToken" type="password" autocomplete="off" placeholder="填写服务的 AUTH_SECRET"></details>
+      <p class="field-help">登录状态使用 HttpOnly Cookie 保存，不写入浏览器存储。模型 API 密钥始终留在后端。</p>
       <div id="connectionResult" class="connection-result" role="status"></div>
       <div class="dialog-actions"><button class="button" id="disconnectService" type="button" hidden>断开连接</button><button class="button primary" id="connectService" type="submit">连接服务</button></div>
     </form>

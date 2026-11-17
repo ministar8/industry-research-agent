@@ -25,19 +25,25 @@
 
 | 角色 | 职责 | 写入的状态字段 |
 |---|---|---|
-| **Supervisor** | 意图解析、任务拆解、路由、结果整合 | `intent` `tasks` `constraints` `plan_notes` `next_action` `rounds` `turn_attempted`（转入子节点时清空旧 `report`） |
+| **Supervisor** | 意图解析、研究对象与任务拆解、路由、结果整合 | `intent` `subjects` `tasks` `constraints` `plan_notes` `next_action` `rounds` `turn_attempted`（转入子节点时清空旧 `report`） |
 | **Researcher** | 多轮检索，记录来源 URL、摘录与置信度 | `sources` `turn_attempted`；检索被拒时置 `abort_reason` |
-| **Analyst** | 去重、交叉验证、识别矛盾与信息缺口 | `analysis` |
-| **Writer** | 输出摘要 / 发现 / 分析 / 结论四段式报告，保留引用锚点 | `report` |
+| **Analyst** | 去重、交叉验证、识别矛盾与信息缺口，建立任务级和对象级证据覆盖判断，区分离散点、变化、趋势与预测 | `analysis` `evidence_coverage` `subject_coverage` `evidence_statements` |
+| **Writer** | 只按已归一化的证据类型控制趋势表达，输出摘要 / 对象证据完整度 / 发现 / 分析 / 结论报告，保留引用锚点 | `report` |
 | **finalize** | 组装报告与来源清单；无成果时返回能力引导 | `messages` |
 
 关键不变量（修改代码时不可破坏）：
 
 1. `finalize` 只做组装，不做生成——它拼接已有的 `report` 或 `analysis`，或返回提示语，**不调用模型**。因此无调研目标的输入不产生任何模型开销。
 2. 没有 chat 子 agent。与调研无关的输入由 Supervisor 剥离后继续调研；确实找不到调研对象时才落到 `finalize` 的提示语。不要再加回对话节点，那会让主控的路由判断变得含糊。
-3. `sources` 跨轮累积，按 URL 去重，不覆盖。
+3. `thread_id` 标识整个对话，`turn_id` 标识一次研究请求。新请求默认以 `context_mode=fresh`
+   开始，隔离上一轮的任务、来源、分析与报告；需要基于上一轮来源重新分析时，显式传
+   `context_mode=reuse`。同一轮内 `sources` 按 URL 去重并合并，不覆盖。
 4. 报告中每个引用锚点 `[n]` 必须能解析到 `sources` 中的一条记录，Writer 不得引入 Researcher 未采集的 URL。
-5. 调度决策是结构化对象（`RoutingDecision`），不是自由文本，因此路由逻辑可在无 LLM 的情况下测试。
+5. 每个 `ResearchTask` 都有一条 `evidence_coverage` 记录，标记覆盖为充分、部分、缺失或冲突，并单独标记结论证据强度；它用于校准分析与写作，不会单独触发额外检索。
+6. `Source.confidence` 是来源层面的检索评分，不等同于子问题结论的证据强度；后者由 Analyst 针对当前任务和来源判断。
+7. `subject_coverage` 按研究对象和证据维度记录完整度；对象缺少关键维度时，系统不会用其他对象的证据替代它。
+8. `evidence_statements` 中，单点只能作为离散事实；两个时期最多作为期间变化；只有三个同口径时间点或来源明确声明时才能作为趋势，规划/预测不得冒充实际趋势。
+9. 调度决策是结构化对象（`RoutingDecision`），不是自由文本，因此路由逻辑可在无 LLM 的情况下测试。
 
 ### 输入形态与抗噪
 
@@ -90,8 +96,12 @@ USE_FAKE_MODEL=true uv run python src/run_service.py
 | `DEFAULT_MODEL` | 覆盖默认模型。百炼侧：`deepseek-v4.1-flash` / `deepseek-v4.1-flash-1017` / `qwen3.8-27b`；DeepSeek 直连：`deepseek-flash` / `deepseek-v4-pro`；另有 OpenAI 与 `fake`。必须是已配置 provider 的模型，否则启动即报错并指出缺哪个 key | 按 key 选择：百炼 → `deepseek-v4.1-flash-1017`，DeepSeek → `deepseek-flash` |
 | `OPENAI_API_KEY` | OpenAI 直连模型（可选），同时是语音功能的凭据 | 空 |
 | `COMPATIBLE_BASE_URL` / `COMPATIBLE_MODEL` | 任意 OpenAI 兼容网关（vLLM / SGLang / 内部网关） | 空 |
-| `AUTH_SECRET` | Bearer token；**未设置时除 `/health` 外所有端点无鉴权** | 空 |
+| `AUTH_SECRET` | 兼容旧版 Bearer token；未设置 JWT 时生效，`/health` 与 `/auth/*` 不受其保护 | 空 |
+| `JWT_SECRET` | 用户登录签名密钥；设置后要求 PostgreSQL，并启用用户名登录与 HttpOnly Cookie | 空 |
+| `JWT_ACCESS_TTL_MINUTES` / `JWT_REFRESH_TTL_DAYS` | Access / Refresh Cookie 有效期 | `15` / `30` |
+| `AUTH_COOKIE_SECURE` | 是否只通过 HTTPS 发送认证 Cookie | `false` |
 | `HOST` / `PORT` / `MODE` | 监听地址、端口；`MODE=dev` 开启热重载 | `0.0.0.0` / `8080` / 空 |
+| `FORWARDED_ALLOW_IPS` | 信任的代理 IP（`X-Forwarded-*`）。反向代理（Render / nginx / Docker）后必须设为 `*` 或代理网段，否则请求 scheme 仍是内部 HTTP，Cookie 鉴权的 Origin 校验会拒绝所有 HTTPS POST | `127.0.0.1` |
 | `LOG_LEVEL` | 日志级别；指标行与 token 归因分别是 INFO / DEBUG，默认级别下不输出 | `WARNING` |
 | `DATABASE_TYPE` | `sqlite` / `postgres` / `mongo` | `sqlite` |
 | `USE_FAKE_MODEL` | 使用假模型验证链路 | `false` |
@@ -105,14 +115,23 @@ USE_FAKE_MODEL=true uv run python src/run_service.py
 | `POST /{agent_id}/invoke` | 非流式调用；`/invoke` 为默认 agent 的别名 |
 | `POST /{agent_id}/stream` | SSE 流式调用；`/stream` 同上 |
 | `POST /{agent_id}/history` | 会话历史；`/history` 同上 |
-| `GET /{agent_id}/threads` | 按 `user_id` 列出历史会话，最近更新在前 |
+| `GET /{agent_id}/threads` | 列出当前登录用户的历史会话，最近更新在前 |
+| `POST /auth/register` / `POST /auth/login` | 注册或登录；认证状态写入 HttpOnly Cookie |
+| `POST /auth/refresh` / `POST /auth/logout` / `GET /auth/me` | 刷新、退出、读取当前用户 |
 | `POST /feedback` | 星级反馈（LangSmith） |
 | `POST /agui/{agent_id}/run` | AG-UI 协议端点，SSE；`/agui/run` 走默认 agent |
 | `GET /health` | 健康检查，唯一不经过 bearer 鉴权的端点 |
 
-`agent_id` 目前只有 `research-supervisor`。除 `/health` 外的端点共用 `AUTH_SECRET` bearer 校验；
-`user_id` 由调用方自报，不与凭据绑定——面向终端用户前需要自己加一层授权。AG-UI 的接入细节见
+`agent_id` 目前只有 `research-supervisor`。设置 `JWT_SECRET` 后，除 `/health` 与 `/auth/*`
+外的端点均要求登录 Cookie；调研、历史和线程列表使用服务端解析出的用户 ID，不信任请求体中的
+`user_id`。Refresh Token 轮换并可通过退出登录撤销。未设置 JWT 时仍保留 `AUTH_SECRET` 和匿名
+开发模式的兼容行为。
+AG-UI 的接入细节见
 [`docs/AGUI.md`](docs/AGUI.md)。
+
+研究请求体支持 `context_mode`：默认 `fresh` 会隔离上一轮研究状态；`reuse` 会保留上一轮来源，
+适用于“基于刚才的来源重新分析”等明确的延续请求。服务端始终生成 `turn_id`，客户端不能通过
+`agent_config` 覆盖它。
 
 ## 目录结构
 
@@ -120,7 +139,8 @@ USE_FAKE_MODEL=true uv run python src/run_service.py
 src/
 ├── agents/
 │   ├── research_team/        # 唯一的业务 agent
-│   │   ├── state.py          # ResearchState 与 Source / ResearchTask 模型
+│   │   ├── contracts.py      # 研究任务、来源与证据覆盖等领域模型
+│   │   ├── state.py          # LangGraph ResearchState 传输状态
 │   │   ├── supervisor.py     # 意图解析、路由、结果整合
 │   │   ├── researcher.py     # 检索与来源置信度评分
 │   │   ├── analyst.py        # 交叉验证与结构化分析
@@ -152,13 +172,21 @@ src/
 | `core/` | 配置、模型工厂、请求指标 | 指标用 contextvar，不写入 `ResearchState` |
 | `memory/` | 三套持久化后端 | 切换只改 `DATABASE_TYPE`，业务代码不感知 |
 | `schema/` | 对外协议模型 | 服务端、客户端、界面共用同一套定义 |
-| `evaluation/` | 评估判据 | 只做确定性结构检查，不评判分析质量 |
+| `evaluation/` | 评估判据 | 做确定性结构与趋势证据检查，不评判分析质量 |
 | `voice/` | STT/TTS 抽象与 provider | 可独立使用，服务端不感知；当前无界面集成 |
+
+`research_team` 内部按依赖方向组织：`graph.py` 只负责节点装配；节点读取并返回
+`ResearchState` 的增量更新；`contracts.py` 定义跨节点共享的领域对象；`search.py`
+只封装外部 Search / Fetch；`helpers.py` 提供模型结构化输出与来源归一化。数据流为
+`Supervisor(tasks, constraints) → Researcher(sources) → Analyst(analysis, coverage) →
+Writer(report) → finalize(messages)`，节点之间不直接调用彼此。
 
 仓库其他目录：
 
 ```text
 static/    # 纯静态项目展示页（HTML / CSS / JS），可独立部署到静态托管
+  js/evaluation-data.js  # 只读离线评测快照；不作为线上运行数据
+  js/runtime-records.js  # /runtime-metrics 响应归一化与真实运行记录边界
 evals/     # 5 个用例、评分脚本、Writer A/B 脚本与 runs/ 历史记录
 tests/     # pytest，按包分层，含 service 的端到端与 smoke 持久化用例
 scripts/   # ab_bench.py、AG-UI 演示客户端（Node）
@@ -203,8 +231,9 @@ uv run langgraph dev
 
 两个设计要点：
 
-- **可信度不由模型猜**：`confidence` 直接由 `authority`（-1~4）与 `rerank_score`（0~3）归一化得出，见 `helpers.confidence_from_authority`。模型的职责只剩"是否与子问题相关"。
+- **来源评分不由模型猜**：`confidence` 直接由 `authority`（-1~4）与 `rerank_score`（0~3）归一化得出，见 `helpers.confidence_from_authority`。它是来源层面的检索信号，不等同于子问题结论的证据强度。
 - **深读有上限**：只对 `authority ≥ 3` 或 `rerank_score ≥ 1.5` 的前 3 条来源调用 Fetch，并按 4000 字截断，避免正文 token 失控。
+- **Judge 前硬过滤**：先丢弃非对象、不可抓取 URL 和标题/摘要/snippet 全空的结果，再按 `url_key` 去重、按候选上限截断，最后才交给 Judge；不按低质量评分删除正常来源。每轮指标记录各类过滤数量，并区分空结果、全无效和全重复。
 
 Search 会同时返回同一篇文章的简繁体版本（`/cn/`、`/tw/`）与手机版（`m.` 主机），`url_key` 会按语言段与主机前缀（`www.` / `m.`）归一化后再去重，否则一篇报道会被当成多个独立来源参与交叉验证。
 
@@ -216,10 +245,15 @@ Search 会同时返回同一篇文章的简繁体版本（`/cn/`、`/tw/`）与�
 |---|---|---|
 | SQLite | `DATABASE_TYPE=sqlite` | 默认，单文件，适合单机 |
 | PostgreSQL | `DATABASE_TYPE=postgres` + `POSTGRES_*` | 本机用 `docker compose up -d postgres` 即可 |
-| MongoDB | `DATABASE_TYPE=mongo` + `MONGO_*` | 仅 checkpoint；长期记忆 store 会回退到 SQLite |
+| MongoDB | `DATABASE_TYPE=mongo` + `MONGO_*` | 仅 checkpoint；长期记忆 store 暂回退到进程内存储 |
 
 当前使用 PostgreSQL 16（本机 Docker，`agent_service` 库），checkpoint 落在 `checkpoints` /
 `checkpoint_writes` / `checkpoint_blobs`，长期记忆落在 `store`。
+SQLite 和 MongoDB 模式的长期记忆目前使用进程内存储，服务重启后不会保留。
+数据总览的运行记录落在 `turn_metrics` 表，跟随 `DATABASE_TYPE`：SQLite 与
+PostgreSQL 重启后保留，MongoDB 回退到进程内统计（重启清零）。记录包含 UTC
+开始/结束时间、模型、问题摘要、报告标题、来源数、耗时、Token、检索调用和错误详情；
+问题内容只保存截断摘要，不保存完整报告；API 返回时会隐藏用户 ID，仅用于服务端过滤。
 
 **Windows 注意**：psycopg 的异步模式不能跑在 Proactor 事件循环上，而 uvicorn 0.54 在
 Windows 上硬编码 Proactor。`run_service.py` 已在「Windows + PostgreSQL」时改为手动构造
@@ -254,6 +288,7 @@ Windows 上硬编码 Proactor。`run_service.py` 已在「Windows + PostgreSQL�
 | `sections` | 四段式结构是否完整 |
 | `caveat` | 是否提示单源/矛盾/口径（关键词代理，非质量评判） |
 | `hint` | 负样本是否返回识别失败提示 |
+| `trend` | 强趋势措辞是否有三个同口径时间点或来源明确声明，并检查规划/预测不得冒充实际趋势 |
 
 ```sh
 PYTHONPATH=src uv run python evals/run_eval.py          # 全部
@@ -262,7 +297,8 @@ PYTHONPATH=src uv run python evals/run_eval.py catl     # 按 id 过滤
 
 每次运行写入 `evals/runs/<时间戳>/`，含每例完整报告与 `summary.md`。改 prompt、换模型后重跑，
 与上一次的 `summary.md` 逐行对比即可判断是否退化。按 id 过滤时同样落盘，但 `summary.md` 里只有
-被跑的那几例——和全量结果比对前先看清用例数。2026-11-14 加入 `meta` 判据后总判据 32→36，
+被跑的那几例——和全量结果比对前先看清用例数。2026-11-14 加入 `meta` 判据后总判据 32→36；
+2026-11-16 加入 `trend` 判据后，全量总判据为 41，
 历史 runs 为 32 判据，跨版本对比先核对判据数。成本列按仓库价表估算，只含 LLM token、不含
 Search/Fetch 费用；`-1017` 这类快照后缀按基础模型计价，未知模型显示 `—`。
 

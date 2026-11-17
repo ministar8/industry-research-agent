@@ -38,6 +38,10 @@ class SearchRejected(RuntimeError):
     """
 
 
+class SearchResponseError(RuntimeError):
+    """Raised when a successful response violates the Search API shape."""
+
+
 def _headers() -> dict[str, str]:
     if not settings.DEEPSEEK_API_KEY:
         raise SearchUnavailable("DEEPSEEK_API_KEY is not configured")
@@ -93,7 +97,9 @@ async def search(
         payload["ori_question"] = ori_question.strip()[:MAX_QUERY_CHARS]
 
     data = await _post("search", payload, timeout=60.0)
-    results = list(data.get("results") or [])
+    if not isinstance(data, dict) or not isinstance(data.get("results"), list):
+        raise SearchResponseError("DeepSeek search returned an invalid results payload")
+    results = data["results"]
     # Counts the request, not the hit rate: an empty page still consumed a call.
     record_search(ok=True)
     return results
@@ -106,6 +112,8 @@ async def fetch(url: str) -> dict[str, str] | None:
         return None
 
     data = await _post("fetch", {"url": url}, timeout=60.0)
+    if not isinstance(data, dict):
+        raise SearchResponseError("DeepSeek fetch returned an invalid response payload")
     content = str(data.get("content") or "")
     if not content:
         record_fetch(ok=False)

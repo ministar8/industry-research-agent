@@ -378,6 +378,6 @@ export const RECORD_LABELS = {
 };
 export function label(record) { return RECORD_LABELS[record.id] || [record.title, '调研记录', record.title, '']; }
 
-export const DATA = PORTFOLIO_DATA;
+export const EVALUATION_SNAPSHOT = PORTFOLIO_DATA;
 /* 负样本以评估判据 hint（应返回"无法识别对象"提示）为准，与 evals/cases.json 同源 */
 export const isNegative = (record) => record.checks.some((c) => c.name === 'hint');

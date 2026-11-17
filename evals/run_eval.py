@@ -7,8 +7,8 @@ Usage:
     PYTHONPATH=src uv run python evals/run_eval.py --budget 150000   # stop at 150k tokens
 
 The score is deterministic: it checks constraint fidelity, delivery format, citation
-anchors and exclusion leaks. It does not judge whether the analysis is any good —
-that still needs a human read of the saved report.
+anchors, exclusion leaks, and whether strong trend claims have eligible structured
+evidence. It does not judge whether the analysis is otherwise good.
 
 Every run writes `evals/runs/<timestamp>/` with one JSON per case plus `summary.md`,
 so two runs can be compared line by line after a prompt or model change.
@@ -77,7 +77,7 @@ async def run_case(case: dict, model: str) -> dict:
         error = f"{type(exc).__name__}: {exc}"
 
     metrics = current()
-    end_turn(token, "error" if error else "ok")
+    await end_turn(token, "error" if error else "ok")
     elapsed = perf_counter() - started
 
     sources = dedupe_sources(state.get("sources"))
@@ -94,6 +94,9 @@ async def run_case(case: dict, model: str) -> dict:
             report=report,
             constraints=state.get("constraints") or [],
             source_count=len(sources),
+            evidence_statements=[
+                item.model_dump() for item in state.get("evidence_statements") or []
+            ],
         )
 
     return {
@@ -104,7 +107,13 @@ async def run_case(case: dict, model: str) -> dict:
         "error": error,
         "intent": state.get("intent"),
         "constraints": state.get("constraints") or [],
+        "subjects": [subject.model_dump() for subject in state.get("subjects") or []],
         "tasks": [task.question for task in state.get("tasks") or []],
+        "evidence_coverage": [item.model_dump() for item in state.get("evidence_coverage") or []],
+        "subject_coverage": [item.model_dump() for item in state.get("subject_coverage") or []],
+        "evidence_statements": [
+            item.model_dump() for item in state.get("evidence_statements") or []
+        ],
         "source_count": len(sources),
         "fetched_count": sum(1 for source in sources if source.content),
         "metrics": {
@@ -117,6 +126,7 @@ async def run_case(case: dict, model: str) -> dict:
             "search_failed": metrics.search_failed if metrics else 0,
             "fetch_failed": metrics.fetch_failed if metrics else 0,
             "fetch_skipped": metrics.fetch_skipped if metrics else 0,
+            "source_filters": dict(metrics.filter_counts) if metrics else {},
             "degraded": list(metrics.degradations) if metrics else [],
         },
         "cost": estimate_cost(
@@ -161,7 +171,8 @@ def write_summary(out_dir: Path, records: list[dict], model: str) -> str:
         f"**合计：{total_passed}/{total_checks} 项通过 （{total_passed / total_checks:.0%}）**",
         "",
         "判据为确定性检查：约束是否落到 `constraints`、交付格式是否出现、引用锚点是否越界、",
-        "排除项是否渗入正文。`caveat` 是关键词代理（单源/矛盾/口径），不代表分析质量。",
+        "排除项是否渗入正文，以及强趋势措辞是否有合格的结构化证据。"
+        "`caveat` 是关键词代理（单源/矛盾/口径），不代表分析质量。",
         "",
         "各用例的完整报告见同目录下的 `<case>.json`。",
     ]

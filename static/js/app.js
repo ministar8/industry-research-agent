@@ -1,6 +1,6 @@
 /* 入口：路由、侧栏菜单、全局快捷键，以及各模块的装配 */
 import { $, icons, notify } from './ui.js';
-import { DATA } from './data.js';
+import { EVALUATION_SNAPSHOT } from './evaluation-data.js';
 import { initSources } from './answer.js';
 import { initReport, renderRecord } from './report.js';
 import { initDashboard } from './dashboard.js';
@@ -9,7 +9,7 @@ import { initConnection } from './connection.js';
 import { renderCopy } from './copy.js';
 
 const state = { focusQuestion: false };
-const titles = { home: '新建调研', data: '数据总览', records: '调研档案', report: '调研档案', chat: '调研会话', about: '关于本项目' };
+const titles = { home: '新建调研', data: '数据总览', records: '评测快照', report: '评测快照', chat: '调研会话', about: '关于本项目' };
 const mobileBreakpoint = () => parseInt(getComputedStyle(document.documentElement).getPropertyValue('--bp-mobile').trim()) || 900;
 
 /* ── 路由与菜单 ── */
@@ -26,7 +26,7 @@ function renderRoute() {
   const [route, id] = location.hash.slice(1).split('/');
   let view = ['home', 'data', 'records', 'about', 'chat'].includes(route) ? route : 'home';
   if (route === 'record') {
-    const record = DATA.cases.find((c) => encodeURIComponent(c.id) === id);
+    const record = EVALUATION_SNAPSHOT.cases.find((c) => encodeURIComponent(c.id) === id);
     if (record) { view = 'report'; renderRecord(record); }
     else notify('未找到这条记录，已返回首页。');
   }
@@ -50,19 +50,6 @@ function renderRoute() {
 /* ── 初始化与全局事件 ── */
 function init() {
   renderCopy(); icons(); closeMenu();
-  if (!DATA.cases.length) {
-    $('composer').hidden = true;
-    $('homeComposer').innerHTML = '<p class="empty-state">评估数据未加载，请检查静态数据文件。</p>';
-    window.addEventListener('hashchange', renderRoute);
-    // 从窄屏切回桌面后，侧栏需要重新可交互（closeMenu 只在路由变化时执行）
-    window.addEventListener('resize', () => {
-      if (!matchMedia(`(max-width: ${mobileBreakpoint()}px)`).matches) {
-        $('sidebar').inert = false; $('workspace').inert = false;
-      }
-    });
-    renderRoute();
-    return;
-  }
   initSources(); initReport(); initDashboard(); initChat(navigate);
   initConnection({ isBusy, onConnected, onDisconnected });
   $('menuToggle').addEventListener('click', () => {
@@ -82,7 +69,7 @@ function init() {
     const prompt = event.target.closest('[data-prompt]');
     if (!prompt) return;
     if (isBusy()) { notify('当前调研仍在进行。'); return; }
-    $('question').value = DATA.cases[Number(prompt.dataset.prompt)].message; $('question').focus();
+    $('question').value = EVALUATION_SNAPSHOT.cases[Number(prompt.dataset.prompt)].message; $('question').focus();
   });
   document.addEventListener('keydown', (event) => {
     if (event.key === 'Escape' && $('sidebar').classList.contains('is-open')) { closeMenu(); $('menuToggle').focus(); }

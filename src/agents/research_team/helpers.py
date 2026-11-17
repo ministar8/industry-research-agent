@@ -13,7 +13,7 @@ from langchain_core.runnables import RunnableConfig
 from openai import LengthFinishReasonError
 from pydantic import BaseModel, ValidationError
 
-from agents.research_team.state import Source
+from agents.research_team.contracts import Source
 from core import get_model, settings
 from core.llm import ModelT
 from core.metrics import record_degradation, record_usage
@@ -410,7 +410,7 @@ def numbered_sources(sources: Sequence[Source], include_excerpt: bool = True) ->
             f"[{index}] {source.title or source.url}",
             f"    URL: {source.url}",
             f"    站点: {source.site_name or '未知'} | 发布: {source.published_at or '未知'}",
-            f"    可信度: {source.confidence:.2f}"
+            f"    来源评分: {source.confidence:.2f}"
             f"（authority {source.authority}, rerank {source.rerank_score:.2f}）",
         ]
         # Skipping the line entirely, rather than printing a placeholder, keeps 12
@@ -430,7 +430,7 @@ def source_appendix(sources: Sequence[Source]) -> str:
         title = source.title or source.url
         published = f"，{source.published_at[:10]}" if source.published_at else ""
         lines.append(
-            f"[{index}] [{title}]({source.url}) — 可信度 {source.confidence:.2f}"
+            f"[{index}] [{title}]({source.url}) — 来源评分 {source.confidence:.2f}"
             f"（{source.site_name or '未知来源'}{published}）"
         )
     return "\n".join(lines)

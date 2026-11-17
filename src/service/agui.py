@@ -22,25 +22,28 @@ from fastapi.responses import StreamingResponse
 from langchain_core.runnables import RunnableConfig
 
 from agents import DEFAULT_AGENT, AgentGraph, get_agent
-from core.metrics import begin_turn, end_turn
+from core.metrics import begin_turn, end_turn, record_result
 from service.utils import ensure_model_available
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/agui")
 
-# Managed by the protocol (thread_id comes from RunAgentInput) or the checkpointer,
-# so clients may not override them via forwardedProps.configurable.
-RESERVED_CONFIGURABLE_KEYS = {"thread_id", "checkpoint_id", "checkpoint_ns"}
+# Managed by the protocol/checkpointer, so clients may not override these values via
+# forwardedProps.configurable.
+RESERVED_CONFIGURABLE_KEYS = {"thread_id", "turn_id", "checkpoint_id", "checkpoint_ns"}
 
 
-def _base_config(input_data: RunAgentInput, agent_id: str) -> RunnableConfig:
+def _base_config(
+    input_data: RunAgentInput, agent_id: str, authenticated_user_id: str | None = None
+) -> RunnableConfig:
     """Build the base RunnableConfig for an AG-UI run.
 
-    Clients can pass configurable values (e.g. `model`, `user_id`, or custom agent
-    config) in `forwardedProps.configurable` - the AG-UI equivalent of the vanilla
-    API's `model` / `user_id` / `agent_config` fields. `thread_id` is taken from
-    the AG-UI input by the `ag-ui-langgraph` package itself.
+    Clients can pass configurable values (e.g. `model` or custom agent config) in
+    `forwardedProps.configurable` - the AG-UI equivalent of the vanilla API's
+    `model` / `agent_config` fields. `thread_id` is taken from the AG-UI input by
+    the `ag-ui-langgraph` package itself. When JWT auth is enabled the user ID
+    comes from the authenticated session, never from the client payload.
     """
     forwarded: dict[str, Any] = input_data.forwarded_props or {}
     configurable = forwarded.get("configurable") or {}
@@ -56,8 +59,19 @@ def _base_config(input_data: RunAgentInput, agent_id: str) -> RunnableConfig:
         ensure_model_available(model)
 
     configurable = dict(configurable)
-    user_id = configurable.setdefault("user_id", str(uuid4()))
+    if authenticated_user_id is not None:
+        configurable["user_id"] = authenticated_user_id
+    user_id = configurable.setdefault("user_id", f"anonymous:{input_data.thread_id}")
+    context_mode = configurable.setdefault("context_mode", "fresh")
+    if context_mode not in {"fresh", "reuse"}:
+        raise HTTPException(
+            status_code=422,
+            detail="forwardedProps.configurable.context_mode must be 'fresh' or 'reuse'",
+        )
 
+    turn_id = str(uuid4())
+    configurable["thread_id"] = input_data.thread_id
+    configurable["turn_id"] = turn_id
     return RunnableConfig(
         configurable=configurable,
         # Recorded in checkpoint metadata so AG-UI threads show up in /threads too.
@@ -74,7 +88,21 @@ async def _event_stream(
 ) -> AsyncGenerator[str, None]:
     # Open the same per-turn collector the vanilla /stream path uses, so AG-UI runs
     # report cost/degradation/failure instead of vanishing from the metrics line.
-    turn = begin_turn(input_data.thread_id)
+    messages = input_data.messages or []
+    query = next(
+        (
+            str(message.content)
+            for message in reversed(messages)
+            if getattr(message, "role", None) == "user"
+        ),
+        "",
+    )
+    turn = begin_turn(
+        input_data.thread_id,
+        config["configurable"].get("user_id"),
+        str(config["configurable"].get("model") or "-"),
+        query,
+    )
     # "closed" means the consumer went away before the run finished.
     outcome = "closed"
     try:
@@ -95,12 +123,17 @@ async def _event_stream(
             yield encoder.encode(event)
         if outcome == "closed":
             outcome = "ok"
-    except Exception:
+        state = await graph.aget_state(config=config)
+        report = state.values.get("report") or ""
+        title = report.splitlines()[0][2:].strip() if report.startswith("# ") else ""
+        record_result(sources_count=len(state.values.get("sources") or []), report_title=title)
+    except Exception as exc:
         outcome = "error"
+        record_result(error=exc)
         logger.exception("AG-UI run failed")
         raise
     finally:
-        end_turn(turn, outcome)
+        await end_turn(turn, outcome)
 
 
 @router.post("/run", operation_id="agui_run_default")
@@ -120,7 +153,13 @@ async def agui_run(
     except KeyError:
         raise HTTPException(status_code=404, detail=f"Agent {agent_id} not found")
 
-    config = _base_config(input_data, agent_id)
+    config = _base_config(input_data, agent_id, getattr(request.state, "auth_user_id", None))
+    # Check thread ownership before the SSE headers go out: an HTTPException raised
+    # inside the streaming generator would reach the client as a truncated 200 stream.
+    state = await graph.aget_state(config=config)
+    metadata = state.metadata or {}
+    if metadata.get("user_id") not in (None, config["configurable"]["user_id"]):
+        raise HTTPException(status_code=404, detail="Thread not found")
     encoder = EventEncoder(accept=request.headers.get("accept", ""))
     return StreamingResponse(
         _event_stream(agent_id, graph, input_data, config, encoder),

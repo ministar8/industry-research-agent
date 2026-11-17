@@ -1,5 +1,6 @@
 """Agent types with async initialization and dynamic graph creation."""
 
+import asyncio
 from abc import ABC, abstractmethod
 
 from langgraph.graph.state import CompiledStateGraph
@@ -13,9 +14,23 @@ class LazyLoadingAgent(ABC):
         """Initialize the agent."""
         self._loaded = False
         self._graph: CompiledStateGraph | Pregel | None = None
+        self._load_lock = asyncio.Lock()
+
+    async def load(self) -> None:
+        """Load the agent once and validate the graph created by the subclass."""
+        if self._loaded:
+            return
+        async with self._load_lock:
+            if self._loaded:
+                return
+            graph = await self._load()
+            if graph is None:
+                raise RuntimeError("Agent load() did not create a graph.")
+            self._graph = graph
+            self._loaded = True
 
     @abstractmethod
-    async def load(self) -> None:
+    async def _load(self) -> CompiledStateGraph | Pregel:
         """
         Perform async loading for this agent.
 
@@ -26,6 +41,11 @@ class LazyLoadingAgent(ABC):
         - Creating the agent's graph
         """
         raise NotImplementedError  # pragma: no cover
+
+    @property
+    def is_loaded(self) -> bool:
+        """Whether the agent has completed loading successfully."""
+        return self._loaded
 
     def get_graph(self) -> CompiledStateGraph | Pregel:
         """

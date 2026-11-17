@@ -101,6 +101,7 @@
 }
 .record-nav a:hover { background: var(--hover); color: var(--ink); }
 .record-nav a[aria-current="page"] { background: var(--selected); }
+.record-nav a span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* 会话空态：与分组标题、列表项同一条左基线 */
 .record-nav .field-help { padding: 0 10px; margin: 2px 0 0; line-height: 1.7; font-size: var(--fs-small); }
 

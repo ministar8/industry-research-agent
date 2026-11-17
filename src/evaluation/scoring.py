@@ -1,13 +1,16 @@
 """Deterministic scoring for the evaluation set.
 
 Only structural properties are checked here: constraint fidelity, delivery format,
-citation anchors that resolve to a recorded source, and exclusions that leaked into
-the body. Whether the cross-validation is *good* is not machine-checkable — the
-`caveat` check is a keyword proxy, not a judgement, and the summary labels it as such.
+citation anchors that resolve to a recorded source, exclusions that leaked into
+the body, and the minimum evidence required for strong trend wording. Whether the
+cross-validation is *good* is not machine-checkable — the `caveat` check is a
+keyword proxy, not a judgement.
 """
 
 import re
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from typing import Any
 
 # A mention inside a sentence that also says "not / excluded" is compliance, not a leak.
 NEGATION_MARKERS = ("不", "未", "排除", "剔除", "不含", "无关", "除外")
@@ -63,6 +66,13 @@ def bullet_items(text: str) -> int:
 _ANCHOR_TAIL = re.compile(r"(?:\[\d+\]\s*)+$")
 _SENTENCE_END = "。！？；…」』\"'.!?;"
 _PROSE_SECTIONS = ("摘要", "分析", "结论")
+_STRONG_TREND_LANGUAGE = re.compile(
+    r"(?:持续(?:增长|上涨|下降|扩张|提升|改善|回落)|"
+    r"连续(?:增长|上涨|下降|提升|回落)|"
+    r"(?:呈|表现出|显示出)(?:明显|持续|长期|总体)?"
+    r"(?:上升|下降|增长|下滑|上涨|回落)趋势|"
+    r"长期(?:上升|增长|上涨|下降))"
+)
 
 
 def _ends_cleanly(text: str) -> bool:
@@ -95,6 +105,61 @@ def truncated_sections(report: str) -> list[str]:
     return bad
 
 
+def _trend_language_in_report(report: str) -> bool:
+    prose: list[str] = []
+    for section in re.split(r"^## ", report, flags=re.MULTILINE)[1:]:
+        title, _, body = section.partition("\n")
+        if title.strip() in _PROSE_SECTIONS or title.strip() == "主要发现":
+            prose.append(body)
+    return bool(_STRONG_TREND_LANGUAGE.search("\n".join(prose)))
+
+
+def trend_failures(
+    statements: Sequence[Mapping[str, Any]],
+    report: str,
+    source_count: int,
+) -> list[str]:
+    """Return violations of the lightweight trend evidence contract."""
+    failures: list[str] = []
+    eligible_trends = 0
+    for index, item in enumerate(statements, start=1):
+        kind = item.get("kind")
+        source_indices = item.get("source_indices") or []
+        valid_sources = [
+            source
+            for source in source_indices
+            if isinstance(source, int) and 1 <= source <= source_count
+        ]
+        if not valid_sources:
+            failures.append(f"证据{index}没有有效来源")
+
+        periods = [period for period in (item.get("periods") or []) if str(period).strip()]
+        value_type = item.get("value_type", "unknown")
+        if kind == "trend":
+            origin = item.get("trend_origin", "unknown")
+            if value_type in {"planned", "forecast"}:
+                failures.append(f"证据{index}将规划/预测标为实际趋势")
+            elif origin == "explicit_source_statement":
+                eligible_trends += 1
+            elif (
+                len(periods) >= 3
+                and value_type in {"actual", "reported"}
+                and str(item.get("metric") or "").strip()
+                and str(item.get("unit") or "").strip()
+            ):
+                eligible_trends += 1
+            else:
+                failures.append(f"证据{index}的趋势缺少三个同口径时间点或完整口径")
+        elif kind == "change" and len(periods) < 2:
+            failures.append(f"证据{index}的期间变化少于两个时间点")
+        elif kind == "forecast" and value_type not in {"planned", "forecast"}:
+            failures.append(f"证据{index}的预测类型不是规划或预测")
+
+    if _trend_language_in_report(report) and not eligible_trends:
+        failures.append("正文使用强趋势措辞但没有合格的趋势证据")
+    return failures
+
+
 def run_checks(
     checks: list[str],
     *,
@@ -102,6 +167,7 @@ def run_checks(
     report: str,
     constraints: list[str],
     source_count: int,
+    evidence_statements: Sequence[Mapping[str, Any]] | None = None,
 ) -> list[CheckResult]:
     results: list[CheckResult] = []
     joined_constraints = " / ".join(constraints)
@@ -164,5 +230,15 @@ def run_checks(
             results.append(CheckResult(check, hit, "" if hit else "未返回识别失败提示"))
         else:
             results.append(CheckResult(check, False, "未知判据"))
+
+    if evidence_statements is not None:
+        failures = trend_failures(evidence_statements, report, source_count)
+        results.append(
+            CheckResult(
+                "trend",
+                not failures,
+                "" if not failures else "；".join(failures),
+            )
+        )
 
     return results

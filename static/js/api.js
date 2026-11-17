@@ -1,29 +1,46 @@
 export const connection = { connected: false, token: '', model: '' };
 
-export async function apiJson(path, body) {
+export async function refreshSession() {
+  const response = await fetch('/auth/refresh', {
+    method: 'POST', credentials: 'include', signal: AbortSignal.timeout(15000), redirect: 'error',
+  });
+  return response.ok;
+}
+
+export async function apiJson(path, body, retry = true) {
   const response = await fetch(`/${path}`, {
     method: body ? 'POST' : 'GET',
     headers: { ...(body ? { 'Content-Type': 'application/json' } : {}), ...(connection.token ? { Authorization: `Bearer ${connection.token}` } : {}) },
     ...(body ? { body: JSON.stringify(body) } : {}),
-    signal: AbortSignal.timeout(15000), redirect: 'error',
+    credentials: 'include', signal: AbortSignal.timeout(15000), redirect: 'error',
   });
+  if (response.status === 401 && retry && !path.startsWith('auth/')) {
+    if (await refreshSession()) return apiJson(path, body, false);
+  }
   if (!response.ok) throw new Error(errorMessage(response.status));
+  if (response.status === 204) return null;
   return response.json();
 }
 
 function errorMessage(status) {
   if (status === 401 || status === 403) return '访问未授权，请检查服务口令。';
-  if (status === 404 || status === 405) return '未找到调研接口。请启动 FastAPI，并从该服务的 /ui/ 打开工作台。';
+  if (status === 404 || status === 405) return '未找到调研接口。请启动 FastAPI，并从该服务的根地址打开工作台。';
   if (status === 422) return '服务未接受输入，请检查问题长度与服务配置。';
   if (status === 429) return '服务请求过于频繁，请稍后手动重试。';
   return `服务暂时不可用（HTTP ${status}），未自动重试。`;
 }
 
 export async function* streamResearch(body, signal) {
-  const response = await fetch('/stream', {
-    method: 'POST', headers: { 'Content-Type': 'application/json', ...(connection.token ? { Authorization: `Bearer ${connection.token}` } : {}) },
+  let response = await fetch('/stream', {
+    method: 'POST', credentials: 'include', headers: { 'Content-Type': 'application/json', ...(connection.token ? { Authorization: `Bearer ${connection.token}` } : {}) },
     body: JSON.stringify({ ...body, stream_tokens: false }), signal, redirect: 'error',
   });
+  if (response.status === 401 && await refreshSession()) {
+    response = await fetch('/stream', {
+      method: 'POST', credentials: 'include', headers: { 'Content-Type': 'application/json', ...(connection.token ? { Authorization: `Bearer ${connection.token}` } : {}) },
+      body: JSON.stringify({ ...body, stream_tokens: false }), signal, redirect: 'error',
+    });
+  }
   if (!response.ok) throw new Error(errorMessage(response.status));
   if (!response.headers.get('content-type')?.includes('text/event-stream') || !response.body) throw new Error('服务未返回有效的调研事件流。');
   const reader = response.body.getReader();

@@ -44,7 +44,7 @@ class TestAgentLoading:
     def test_get_agent_lazy_agent_not_loaded(self):
         """Test getting a lazy agent that hasn't been loaded."""
         mock_agent = Mock(spec=LazyLoadingAgent)
-        mock_agent._loaded = False
+        mock_agent.is_loaded = False
 
         with patch.dict(agents, {"test-lazy-agent": Mock(graph_like=mock_agent)}):
             with pytest.raises(
@@ -55,7 +55,7 @@ class TestAgentLoading:
     def test_get_agent_lazy_agent_loaded(self):
         """Test getting a lazy agent that has been loaded."""
         mock_agent = Mock(spec=LazyLoadingAgent)
-        mock_agent._loaded = True
+        mock_agent.is_loaded = True
         mock_graph = Mock()
         mock_agent.get_graph.return_value = mock_graph
 

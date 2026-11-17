@@ -57,6 +57,9 @@ services:
         - path: src/core/
           action: sync+restart
           target: /app/core/
+        - path: src/auth/
+          action: sync+restart
+          target: /app/auth/
         - path: src/memory/
           action: sync+restart
           target: /app/memory/

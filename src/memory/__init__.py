@@ -1,4 +1,4 @@
-from contextlib import AbstractAsyncContextManager
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 
 from langgraph.checkpoint.mongodb import MongoDBSaver
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
@@ -8,6 +8,7 @@ from core.settings import DatabaseType, settings
 from memory.mongodb import get_mongo_saver
 from memory.postgres import get_postgres_saver, get_postgres_store
 from memory.sqlite import get_sqlite_saver, get_sqlite_store
+from memory.turns import get_postgres_turn_store, get_sqlite_turn_store
 
 
 def initialize_database() -> AbstractAsyncContextManager[
@@ -28,13 +29,31 @@ def initialize_database() -> AbstractAsyncContextManager[
 def initialize_store():
     """
     Initialize the appropriate store based on configuration.
-    Returns an async context manager for the initialized store.
+    Returns an async context manager for the initialized store. SQLite and MongoDB
+    currently use an in-memory store because LangGraph has no SQLite store backend.
     """
     if settings.DATABASE_TYPE == DatabaseType.POSTGRES:
         return get_postgres_store()
     # TODO: Add Mongo store - https://pypi.org/project/langgraph-store-mongodb/
-    else:  # Default to SQLite
+    else:  # SQLite/MongoDB: use the in-memory fallback
         return get_sqlite_store()
 
 
-__all__ = ["initialize_database", "initialize_store"]
+@asynccontextmanager
+async def _no_turn_store():
+    yield None
+
+
+def initialize_turn_store():
+    """
+    Initialize the durable turn-metrics store for the runtime dashboard.
+    MongoDB has no turn store and falls back to the in-process collector.
+    """
+    if settings.DATABASE_TYPE == DatabaseType.POSTGRES:
+        return get_postgres_turn_store()
+    if settings.DATABASE_TYPE == DatabaseType.SQLITE:
+        return get_sqlite_turn_store()
+    return _no_turn_store()
+
+
+__all__ = ["initialize_database", "initialize_store", "initialize_turn_store"]

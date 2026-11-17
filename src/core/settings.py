@@ -67,9 +67,17 @@ class Settings(BaseSettings):
     HOST: str = "0.0.0.0"
     PORT: int = 8080
     GRACEFUL_SHUTDOWN_TIMEOUT: int = 30
+    # Trusted proxy IPs for X-Forwarded-* headers. Behind a reverse proxy (Render,
+    # Docker, nginx) set "*" or the proxy CIDR, otherwise the request scheme/host stay
+    # internal and the cookie-auth Origin check rejects every cross-HTTPS POST.
+    FORWARDED_ALLOW_IPS: str = "127.0.0.1"
     LOG_LEVEL: LogLevel = LogLevel.WARNING
 
     AUTH_SECRET: SecretStr | None = None
+    JWT_SECRET: SecretStr | None = None
+    JWT_ACCESS_TTL_MINUTES: int = 15
+    JWT_REFRESH_TTL_DAYS: int = 30
+    AUTH_COOKIE_SECURE: bool = False
 
     DEEPSEEK_API_KEY: SecretStr | None = None
     OPENAI_API_KEY: SecretStr | None = None

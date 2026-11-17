@@ -7,6 +7,7 @@ from evaluation.scoring import (
     bullet_items,
     run_checks,
     table_rows,
+    trend_failures,
     truncated_sections,
 )
 
@@ -104,3 +105,77 @@ def test_meta_check_passes_legitimate_near_misses():
 def test_meta_check_passes_empty_report():
     results = run_checks(["meta"], answer="", report="", constraints=[], source_count=0)
     assert results[0].passed is True
+
+
+def test_trend_failures_accepts_three_comparable_actual_periods():
+    statements = [
+        {
+            "kind": "trend",
+            "periods": ["2022", "2023", "2024"],
+            "value_type": "actual",
+            "metric": "产能",
+            "unit": "GWh",
+            "source_indices": [1, 2],
+            "trend_origin": "computed",
+        }
+    ]
+
+    assert trend_failures(statements, "## 分析\n产能呈上升趋势 [1][2]。", 2) == []
+
+
+def test_trend_failures_rejects_two_periods_and_unbacked_report_language():
+    statements = [
+        {
+            "kind": "trend",
+            "periods": ["2023", "2024"],
+            "value_type": "actual",
+            "metric": "产能",
+            "unit": "GWh",
+            "source_indices": [1],
+            "trend_origin": "computed",
+        }
+    ]
+
+    failures = trend_failures(statements, "## 分析\n产能持续增长 [1]。", 1)
+
+    assert any("缺少三个" in failure for failure in failures)
+    assert "正文使用强趋势措辞但没有合格的趋势证据" in failures
+
+
+def test_trend_failures_rejects_planned_trend_and_invalid_change():
+    statements = [
+        {
+            "kind": "trend",
+            "periods": ["2025", "2026", "2027"],
+            "value_type": "planned",
+            "metric": "产能",
+            "unit": "GWh",
+            "source_indices": [1],
+        },
+        {
+            "kind": "change",
+            "periods": ["2025"],
+            "value_type": "actual",
+            "source_indices": [1],
+        },
+    ]
+
+    failures = trend_failures(statements, "", 1)
+
+    assert "证据1将规划/预测标为实际趋势" in failures
+    assert "证据2的期间变化少于两个时间点" in failures
+
+
+def test_run_checks_adds_trend_check_when_evidence_is_provided():
+    results = run_checks(
+        [],
+        answer="",
+        report="## 分析\n产能持续增长。",
+        constraints=[],
+        source_count=0,
+        evidence_statements=[],
+    )
+
+    assert len(results) == 1
+    assert results[0].name == "trend"
+    assert results[0].passed is False

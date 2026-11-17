@@ -70,7 +70,7 @@ async def main() -> None:
         token = begin_turn(f"ab-writer-{label}")
         out = await writer_mod.writer(state, config)  # type: ignore[arg-type]
         metrics = current()
-        end_turn(token, "ok")
+        await end_turn(token, "ok")
         report = out.get("report") or ""
         results.append(
             {

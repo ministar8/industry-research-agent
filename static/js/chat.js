@@ -3,8 +3,10 @@ import { $, esc, notify, download } from './ui.js';
 import { connection, apiJson, streamResearch } from './api.js';
 import { parseAnswer, markdown, sourceGroups } from './answer.js';
 import { lockConnect, openConnectionDialog } from './connection.js';
+import { clearDashboard, refreshDashboard } from './dashboard.js';
 
 const state = { threadId: null, controller: null, sequence: 0, historyVersion: 0, loadingHistory: false, sources: [], userId: crypto.randomUUID() };
+// 非 JWT 模式没有会话身份，用设备级 ID 归组线程；JWT 模式下服务端以登录身份为准，忽略此值。
 try { state.userId = localStorage.getItem('research-user-id') || state.userId; localStorage.setItem('research-user-id', state.userId); } catch { /* Storage may be disabled by the browser. */ }
 
 export function isBusy() { return state.controller !== null || state.loadingHistory; }
@@ -57,7 +59,7 @@ export async function loadHistory(id) {
   const version = ++state.historyVersion; state.loadingHistory = true; busy(true); $('stopWaiting').hidden = true;
   state.threadId = null; state.sources = []; $('chatSources').innerHTML = '<li class="src-empty">正在读取会话来源…</li>'; $('chatSourceCount').textContent = ''; $('chatMessages').textContent = '正在读取会话…';
   try {
-    const result = await apiJson('history', { thread_id: id });
+    const result = await apiJson('history', { thread_id: id, user_id: state.userId });
     if (version !== state.historyVersion || !connection.connected) return;
     state.threadId = id; $('chatMessages').replaceChildren(); $('question').value = '';
     let answers = [];
@@ -108,8 +110,8 @@ async function sendQuestion(event, navigate) {
 }
 
 /* ── 连接状态回调（由 connection.js 触发） ── */
-export function onConnected() { state.historyVersion++; refreshHistory(); }
-export function onDisconnected() { state.controller?.abort(); state.historyVersion++; $('historySection').hidden = true; }
+export function onConnected() { state.historyVersion++; refreshHistory(); refreshDashboard(); }
+export function onDisconnected() { state.controller?.abort(); state.historyVersion++; $('historySection').hidden = true; clearDashboard(); }
 
 export function initChat(navigate) {
   $('composer').addEventListener('submit', (e) => sendQuestion(e, navigate));
