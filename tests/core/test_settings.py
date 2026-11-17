@@ -3,28 +3,17 @@ import os
 from unittest.mock import patch
 
 import pytest
-from pydantic import SecretStr, ValidationError
+from pydantic import SecretStr
 
-from core.settings import LogLevel, Settings, check_str_is_http
+from core.settings import DatabaseType, LogLevel, Settings
 from schema.models import DashScopeModelName, DeepseekModelName, FakeModelName, OpenAIModelName
-
-
-def test_check_str_is_http():
-    # Test valid HTTP URLs
-    assert check_str_is_http("http://example.com/") == "http://example.com/"
-    assert check_str_is_http("https://api.test.com/") == "https://api.test.com/"
-
-    # Test invalid URLs
-    with pytest.raises(ValidationError):
-        check_str_is_http("not_a_url")
-    with pytest.raises(ValidationError):
-        check_str_is_http("ftp://invalid.com")
 
 
 def test_settings_default_values():
     settings = Settings(_env_file=None)
     assert settings.HOST == "0.0.0.0"
     assert settings.PORT == 8080
+    assert settings.DATABASE_TYPE == DatabaseType.POSTGRES
     assert settings.USE_FAKE_MODEL is False
 
 

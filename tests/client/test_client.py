@@ -242,39 +242,14 @@ def test_parse_stream_line_raises_client_error(agent_client):
     """Malformed frames raise AgentClientError so the caller's error handling catches them."""
     with pytest.raises(AgentClientError, match="JSON parsing"):
         agent_client._parse_stream_line("data: {not valid json")
+    with pytest.raises(AgentClientError, match="invalid event type"):
+        agent_client._parse_stream_line("data: {}")
+    with pytest.raises(AgentClientError, match="without content"):
+        agent_client._parse_stream_line('data: {"type": "token"}')
     with pytest.raises(AgentClientError, match="invalid message"):
         agent_client._parse_stream_line(
             "data: " + json.dumps({"type": "message", "content": {"type": "ai"}})
         )
-
-
-@pytest.mark.asyncio
-async def test_acreate_feedback(agent_client):
-    """Test asynchronous feedback creation."""
-    RUN_ID = "test-run"
-    KEY = "test-key"
-    SCORE = 0.8
-    KWARGS = {"comment": "Great response!"}
-
-    # Test successful response
-    mock_response = Response(200, json={}, request=Request("POST", "http://test/feedback"))
-    with patch("httpx.AsyncClient.post", return_value=mock_response) as mock_post:
-        await agent_client.acreate_feedback(RUN_ID, KEY, SCORE, KWARGS)
-        # Verify request
-        args, kwargs = mock_post.call_args
-        assert kwargs["json"]["run_id"] == RUN_ID
-        assert kwargs["json"]["key"] == KEY
-        assert kwargs["json"]["score"] == SCORE
-        assert kwargs["json"]["kwargs"] == KWARGS
-
-    # Test error response
-    error_response = Response(
-        500, text="Internal Server Error", request=Request("POST", "http://test/feedback")
-    )
-    with patch("httpx.AsyncClient.post", return_value=error_response):
-        with pytest.raises(AgentClientError) as exc:
-            await agent_client.acreate_feedback(RUN_ID, KEY, SCORE)
-        assert "500 Internal Server Error" in str(exc.value)
 
 
 def test_get_history(agent_client):

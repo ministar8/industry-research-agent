@@ -9,7 +9,7 @@ from schema import AgentInfo
 
 @pytest.mark.asyncio
 async def test_lifespan(monkeypatch, caplog) -> None:
-    """Test that the lifespan sets up the database and store, loads the agents, and logs errors."""
+    """Test that the lifespan sets up the database and wires the agents."""
     from service import service
 
     fake_saver_setup = False
@@ -47,17 +47,16 @@ async def test_lifespan(monkeypatch, caplog) -> None:
         "bad": type("Agent", (), {"checkpointer": None, "store": None})(),
     }
 
-    async def fake_load_agent(agent_key: str) -> None:
+    def fake_get_agent(agent_key: str):
         if agent_key == "bad":
             raise RuntimeError("boom")
-
-    def fake_get_agent(agent_key: str):
         return agents[agent_key]
 
     monkeypatch.setattr(service, "initialize_database", fake_initialize_database)
     monkeypatch.setattr(service, "initialize_store", fake_initialize_store)
     monkeypatch.setattr(service, "initialize_turn_store", fake_initialize_turn_store)
-    monkeypatch.setattr(service, "load_agent", fake_load_agent)
+    turn_sinks = []
+    monkeypatch.setattr(service, "set_turn_sink", turn_sinks.append)
     monkeypatch.setattr(service, "get_agent", fake_get_agent)
     monkeypatch.setattr(
         service,
@@ -71,17 +70,17 @@ async def test_lifespan(monkeypatch, caplog) -> None:
     caplog.set_level(logging.INFO, logger=service.logger.name)
 
     app = FastAPI()
-    async with service.lifespan(app):
-        assert app.state.turn_store is fake_turn_store
+    with pytest.raises(RuntimeError, match="boom"):
+        async with service.lifespan(app):
+            pytest.fail("lifespan should fail before serving requests")
 
     assert fake_saver_setup
     assert fake_store_setup
     assert agents["good"].checkpointer is fake_saver
     assert agents["good"].store is fake_store
-    # A failed agent is skipped entirely: wiring it would attach a checkpointer to a
-    # graph that never finished loading, and an unguarded get_agent would crash startup.
     assert agents["bad"].checkpointer is None
     assert agents["bad"].store is None
+    assert turn_sinks == [fake_turn_store, None]
 
     assert "Agent loaded: good" in caplog.text
-    assert "Failed to load agent bad" in caplog.text
+    assert "Error during database/store/agents initialization" in caplog.text

@@ -1,14 +1,8 @@
 from enum import StrEnum
-from typing import Annotated, Any
+from typing import Any
 
 from dotenv import find_dotenv
-from pydantic import (
-    BeforeValidator,
-    HttpUrl,
-    SecretStr,
-    TypeAdapter,
-    computed_field,
-)
+from pydantic import SecretStr, computed_field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from schema.models import (
@@ -49,11 +43,6 @@ class LogLevel(StrEnum):
         return mapping[self]
 
 
-def check_str_is_http(x: str) -> str:
-    http_url_adapter = TypeAdapter(HttpUrl)
-    return str(http_url_adapter.validate_python(x))
-
-
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=find_dotenv(),
@@ -77,7 +66,7 @@ class Settings(BaseSettings):
     JWT_SECRET: SecretStr | None = None
     JWT_ACCESS_TTL_MINUTES: int = 15
     JWT_REFRESH_TTL_DAYS: int = 30
-    AUTH_COOKIE_SECURE: bool = False
+    AUTH_COOKIE_SECURE: bool = True
 
     DEEPSEEK_API_KEY: SecretStr | None = None
     OPENAI_API_KEY: SecretStr | None = None
@@ -103,15 +92,8 @@ class Settings(BaseSettings):
     COMPATIBLE_API_KEY: SecretStr | None = None
     COMPATIBLE_BASE_URL: str | None = None
 
-    LANGCHAIN_TRACING_V2: bool = False
-    LANGCHAIN_PROJECT: str = "default"
-    LANGCHAIN_ENDPOINT: Annotated[str, BeforeValidator(check_str_is_http)] = (
-        "https://api.smith.langchain.com"
-    )
-    LANGCHAIN_API_KEY: SecretStr | None = None
-
     # Database Configuration
-    DATABASE_TYPE: DatabaseType = DatabaseType.SQLITE
+    DATABASE_TYPE: DatabaseType = DatabaseType.POSTGRES
     SQLITE_DB_PATH: str = "checkpoints.db"
 
     # PostgreSQL Configuration

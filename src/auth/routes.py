@@ -1,3 +1,5 @@
+import time
+from collections import deque
 from typing import Annotated
 from uuid import UUID
 
@@ -11,11 +13,51 @@ from .store import AuthStore, AuthUser
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
+_LOGIN_WINDOW_SECONDS = 60
+_LOGIN_FAILURE_LIMIT = 5
+_MAX_LOGIN_KEYS = 10_000
+_login_failures: dict[str, deque[float]] = {}
+
 
 def _check_origin(request: Request) -> None:
     origin = request.headers.get("origin")
     if origin and origin.rstrip("/") != str(request.base_url).rstrip("/"):
         raise HTTPException(status_code=403, detail="请求来源不被允许。")
+
+
+def _login_key(request: Request, username: str) -> str:
+    client_host = request.client.host if request.client else "unknown"
+    return f"{client_host}:{username.strip().lower()}"
+
+
+def _check_login_limit(key: str) -> None:
+    now = time.monotonic()
+    failures = _login_failures.get(key)
+    if failures is None:
+        return
+    while failures and now - failures[0] >= _LOGIN_WINDOW_SECONDS:
+        failures.popleft()
+    if not failures:
+        _login_failures.pop(key, None)
+        return
+    if len(failures) >= _LOGIN_FAILURE_LIMIT:
+        retry_after = max(1, int(_LOGIN_WINDOW_SECONDS - (now - failures[0])))
+        raise HTTPException(
+            status_code=429,
+            detail="登录尝试过于频繁，请稍后再试。",
+            headers={"Retry-After": str(retry_after)},
+        )
+
+
+def _record_login_failure(key: str) -> None:
+    if key not in _login_failures and len(_login_failures) >= _MAX_LOGIN_KEYS:
+        oldest_key = min(_login_failures, key=lambda item: _login_failures[item][-1])
+        _login_failures.pop(oldest_key, None)
+    _login_failures.setdefault(key, deque()).append(time.monotonic())
+
+
+def _clear_login_failures(key: str) -> None:
+    _login_failures.pop(key, None)
 
 
 def get_auth_store(request: Request) -> AuthStore:
@@ -72,12 +114,17 @@ async def login(
     store: Annotated[AuthStore, Depends(get_auth_store)],
 ) -> AuthResponse:
     _check_origin(request)
+    login_key = _login_key(request, payload.username)
+    _check_login_limit(login_key)
     try:
         user = await store.authenticate(payload.username, payload.password)
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        _record_login_failure(login_key)
+        raise HTTPException(status_code=401, detail="用户名或密码错误。") from exc
     if user is None:
+        _record_login_failure(login_key)
         raise HTTPException(status_code=401, detail="用户名或密码错误。")
+    _clear_login_failures(login_key)
     _set_auth_cookies(response, user)
     return AuthResponse(user=_user_response(user))
 
@@ -115,12 +162,22 @@ async def logout(
 ) -> None:
     _check_origin(request)
     token = request.cookies.get("refresh_token")
+    revoked = False
     if token:
         try:
             claims = decode_token(token, "refresh")
             await store.revoke_refresh_tokens(UUID(claims["sub"]))
+            revoked = True
         except (ValueError, KeyError):
             pass
+    if not revoked:
+        access_token = request.cookies.get("access_token")
+        if access_token:
+            try:
+                claims = decode_token(access_token, "access")
+                await store.revoke_refresh_tokens(UUID(claims["sub"]))
+            except (ValueError, KeyError):
+                pass
     response.delete_cookie("access_token")
     response.delete_cookie("refresh_token")
 

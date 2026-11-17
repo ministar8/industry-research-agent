@@ -5,7 +5,21 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "evals"))
 
-from run_eval import estimate_cost  # noqa: E402
+from run_eval import estimate_cost, parse_args  # noqa: E402
+
+
+def test_parse_args_keeps_budget_value_out_of_case_selection():
+    args = parse_args(["--budget", "150000"])
+
+    assert args.selection is None
+    assert args.budget == 150000
+
+
+def test_parse_args_supports_case_selection_and_budget():
+    args = parse_args(["ess-cell", "--budget=150000"])
+
+    assert args.selection == "ess-cell"
+    assert args.budget == 150000
 
 
 def test_estimate_cost_prices_snapshot_suffix_like_base_model():

@@ -16,6 +16,27 @@ from core import settings
 from schema import ChatMessage
 
 
+def thread_metadata_matches(
+    metadata: Mapping[str, Any],
+    *,
+    expected_user_id: str | None,
+    expected_agent_id: str,
+    reject_missing_user: bool = False,
+) -> bool:
+    """Check thread ownership and agent scope while allowing legacy metadata."""
+    stored_user_id = metadata.get("user_id")
+    if reject_missing_user and stored_user_id is None:
+        return False
+    if (
+        expected_user_id is not None
+        and stored_user_id is not None
+        and stored_user_id != expected_user_id
+    ):
+        return False
+    stored_agent_id = metadata.get("agent_id")
+    return stored_agent_id is None or stored_agent_id == expected_agent_id
+
+
 def ensure_model_available(model: Any) -> None:
     """Raise 400 if `model` isn't in the operator's AVAILABLE_MODELS allowlist."""
     if model not in settings.AVAILABLE_MODELS:

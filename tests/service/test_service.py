@@ -2,7 +2,6 @@ import json
 import logging
 from unittest.mock import AsyncMock, patch
 
-import langsmith
 import pytest
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage
 from langgraph.types import Interrupt, StateSnapshot
@@ -216,52 +215,6 @@ def test_invoke_interrupt(test_client, mock_agent) -> None:
     output = ChatMessage.model_validate(response.json())
     assert output.type == "ai"
     assert output.content == INTERRUPT
-
-
-@patch("service.service.LangsmithClient")
-def test_feedback(mock_client: langsmith.Client, test_client) -> None:
-    ls_instance = mock_client.return_value
-    ls_instance.create_feedback.return_value = None
-    body = {
-        "run_id": "847c6285-8fc9-4560-a83f-4e6285809254",
-        "key": "human-feedback-stars",
-        "score": 0.8,
-    }
-    response = test_client.post("/feedback", json=body)
-    assert response.status_code == 200
-    assert response.json() == {"status": "success"}
-    ls_instance.create_feedback.assert_called_once_with(
-        run_id="847c6285-8fc9-4560-a83f-4e6285809254",
-        key="human-feedback-stars",
-        score=0.8,
-    )
-
-
-@patch("service.service.LangsmithClient")
-def test_feedback_create_error_returns_structured_500(mock_client, test_client) -> None:
-    """A LangSmith call failure is a structured 500, not a raw traceback."""
-    mock_client.return_value.create_feedback.side_effect = RuntimeError("langsmith down")
-    body = {
-        "run_id": "847c6285-8fc9-4560-a83f-4e6285809254",
-        "key": "human-feedback-stars",
-        "score": 0.8,
-    }
-    response = test_client.post("/feedback", json=body)
-    assert response.status_code == 500
-    assert response.json() == {"detail": "Unexpected error"}
-
-
-@patch("service.service.LangsmithClient", side_effect=RuntimeError("no api key"))
-def test_feedback_client_init_error_returns_structured_500(mock_client, test_client) -> None:
-    """A missing LangSmith key fails at client construction; still a structured 500."""
-    body = {
-        "run_id": "847c6285-8fc9-4560-a83f-4e6285809254",
-        "key": "human-feedback-stars",
-        "score": 0.8,
-    }
-    response = test_client.post("/feedback", json=body)
-    assert response.status_code == 500
-    assert response.json() == {"detail": "Unexpected error"}
 
 
 def test_history(test_client, mock_agent) -> None:
@@ -524,7 +477,7 @@ def test_stream_interrupt(test_client, mock_agent) -> None:
 def test_info(test_client, mock_settings) -> None:
     """Test that /info returns the correct service metadata."""
 
-    base_agent = Agent(description="A base agent.", graph_like=None)
+    base_agent = Agent(description="A base agent.", graph=None)
     mock_settings.AUTH_SECRET = None
     mock_settings.DEFAULT_MODEL = OpenAIModelName.GPT_6_LUNA
     mock_settings.AVAILABLE_MODELS = {OpenAIModelName.GPT_6_LUNA, OpenAIModelName.GPT_61_TERRA}
@@ -597,6 +550,51 @@ def test_invoke_rejects_a_thread_owned_by_another_user(test_client, mock_agent) 
     response = test_client.post(
         "/invoke",
         json={"message": "继续研究", "thread_id": "shared-thread", "user_id": "bob"},
+    )
+
+    assert response.status_code == 404
+    mock_agent.ainvoke.assert_not_awaited()
+
+
+def test_invoke_rejects_a_thread_owned_by_another_agent(test_client, mock_agent) -> None:
+    mock_agent.aget_state.return_value = StateSnapshot(
+        values={"messages": []},
+        next=(),
+        config={},
+        metadata={"user_id": "alice", "agent_id": "other-agent"},
+        created_at=None,
+        parent_config=None,
+        tasks=(),
+        interrupts=(),
+    )
+
+    response = test_client.post(
+        "/invoke",
+        json={"message": "继续研究", "thread_id": "shared-thread", "user_id": "alice"},
+    )
+
+    assert response.status_code == 404
+    mock_agent.ainvoke.assert_not_awaited()
+
+
+def test_jwt_rejects_a_legacy_thread_without_user_metadata(monkeypatch, mock_agent) -> None:
+    from langchain_core.messages import HumanMessage
+
+    client = _jwt_client(monkeypatch)
+    mock_agent.aget_state.return_value = StateSnapshot(
+        values={"messages": [HumanMessage(content="legacy")]},
+        next=(),
+        config={},
+        metadata={"agent_id": "research-supervisor"},
+        created_at=None,
+        parent_config=None,
+        tasks=(),
+        interrupts=(),
+    )
+
+    response = client.post(
+        "/invoke",
+        json={"message": "继续研究", "thread_id": "legacy-thread"},
     )
 
     assert response.status_code == 404

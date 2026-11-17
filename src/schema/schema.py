@@ -1,10 +1,49 @@
+import json
+import re
 from datetime import datetime
-from typing import Any, Literal, NotRequired
+from typing import Annotated, Any, Literal, NotRequired
 
-from pydantic import BaseModel, Field, SerializeAsAny, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SerializeAsAny,
+    StringConstraints,
+    field_validator,
+)
 from typing_extensions import TypedDict
 
 from schema.models import AllModelEnum, DeepseekModelName, OpenAIModelName
+
+AGENT_CONFIG_MAX_BYTES = 32 * 1024
+_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9._:-]+$")
+Identifier = Annotated[
+    str,
+    StringConstraints(min_length=1, max_length=255, pattern=_IDENTIFIER_PATTERN.pattern),
+]
+
+
+def validate_agent_config_size(value: dict[str, Any]) -> dict[str, Any]:
+    try:
+        encoded = json.dumps(
+            value,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise ValueError("agent_config must contain JSON-compatible values") from exc
+    if len(encoded) > AGENT_CONFIG_MAX_BYTES:
+        raise ValueError(f"agent_config must be at most {AGENT_CONFIG_MAX_BYTES} UTF-8 bytes")
+    return value
+
+
+def validate_identifier(value: str, field_name: str = "identifier") -> str:
+    if not _IDENTIFIER_PATTERN.fullmatch(value):
+        raise ValueError(
+            f"{field_name} may contain only ASCII letters, digits, '.', '_', ':' and '-'"
+        )
+    return value
 
 
 class AgentInfo(BaseModel):
@@ -66,6 +105,8 @@ class AuthResponse(BaseModel):
 class UserInput(BaseModel):
     """Basic user input for the agent."""
 
+    model_config = ConfigDict(validate_assignment=True)
+
     message: str = Field(
         description="User input to the agent.",
         max_length=20_000,
@@ -77,20 +118,18 @@ class UserInput(BaseModel):
         default=None,
         examples=[DeepseekModelName.DEEPSEEK_FLASH, OpenAIModelName.GPT_6_LUNA],
     )
-    thread_id: str | None = Field(
+    thread_id: Identifier | None = Field(
         description="Thread ID to persist and continue a multi-turn conversation.",
         default=None,
-        max_length=255,
         examples=["847c6285-8fc9-4560-a83f-4e6285809254"],
     )
     context_mode: Literal["fresh", "reuse"] = Field(
         description="Whether the research turn starts fresh or reuses the previous turn's sources.",
         default="fresh",
     )
-    user_id: str | None = Field(
+    user_id: Identifier | None = Field(
         description="User ID to persist and continue a conversation across multiple threads.",
         default=None,
-        max_length=255,
         examples=["847c6285-8fc9-4560-a83f-4e6285809254"],
     )
     agent_config: dict[str, Any] = Field(
@@ -103,6 +142,7 @@ class UserInput(BaseModel):
     @classmethod
     def validate_agent_config(cls, value: dict[str, Any]) -> dict[str, Any]:
         # Validate before StreamingResponse sends headers or any checkpoint is read.
+        validate_agent_config_size(value)
         reserved_keys = {
             "thread_id",
             "turn_id",
@@ -114,6 +154,13 @@ class UserInput(BaseModel):
         }
         if overlap := reserved_keys & value.keys():
             raise ValueError(f"agent_config contains reserved keys: {sorted(overlap)}")
+        return value
+
+    @field_validator("message")
+    @classmethod
+    def validate_message_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("message must not be blank")
         return value
 
 
@@ -189,44 +236,16 @@ class ChatMessage(BaseModel):
         print(self.pretty_repr())  # noqa: T201
 
 
-class Feedback(BaseModel):  # type: ignore[no-redef]
-    """Feedback for a run, to record to LangSmith."""
-
-    run_id: str = Field(
-        description="Run ID to record feedback for.",
-        examples=["847c6285-8fc9-4560-a83f-4e6285809254"],
-    )
-    key: str = Field(
-        description="Feedback key.",
-        examples=["human-feedback-stars"],
-    )
-    score: float = Field(
-        description="Feedback score.",
-        examples=[0.8],
-    )
-    kwargs: dict[str, Any] = Field(
-        description="Additional feedback kwargs, passed to LangSmith.",
-        default={},
-        examples=[{"comment": "In-line human feedback"}],
-    )
-
-
-class FeedbackResponse(BaseModel):
-    status: Literal["success"] = "success"
-
-
 class ChatHistoryInput(BaseModel):
     """Input for retrieving chat history."""
 
-    thread_id: str = Field(
+    thread_id: Identifier = Field(
         description="Thread ID to persist and continue a multi-turn conversation.",
-        max_length=255,
         examples=["847c6285-8fc9-4560-a83f-4e6285809254"],
     )
-    user_id: str | None = Field(
+    user_id: Identifier | None = Field(
         description="User ID that owns the thread.",
         default=None,
-        max_length=255,
     )
 
 
@@ -237,10 +256,9 @@ class ChatHistory(BaseModel):
 class UserThreadsInput(BaseModel):
     """Input for listing a user's conversation threads."""
 
-    user_id: str | None = Field(
+    user_id: Identifier | None = Field(
         description="User ID to list threads for.",
         default=None,
-        max_length=255,
         examples=["847c6285-8fc9-4560-a83f-4e6285809254"],
     )
     limit: int = Field(

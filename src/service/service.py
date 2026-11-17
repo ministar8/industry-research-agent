@@ -4,7 +4,7 @@ import logging
 import re
 import secrets
 import warnings
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Mapping
 from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Any
@@ -25,11 +25,9 @@ from langchain_core.messages import (
 )
 from langchain_core.runnables import RunnableConfig
 from langgraph.types import Command, Interrupt
-from langsmith import Client as LangsmithClient
-from langsmith import uuid7
 from starlette.types import Scope
 
-from agents import DEFAULT_AGENT, AgentGraph, get_agent, get_all_agent_info, load_agent
+from agents import DEFAULT_AGENT, AgentGraph, get_agent, get_all_agent_info
 from auth.routes import router as auth_router
 from auth.security import decode_token, jwt_enabled
 from auth.store import get_auth_store
@@ -40,8 +38,6 @@ from schema import (
     ChatHistory,
     ChatHistoryInput,
     ChatMessage,
-    Feedback,
-    FeedbackResponse,
     ServiceMetadata,
     StreamInput,
     UserInput,
@@ -56,6 +52,7 @@ from service.utils import (
     langchain_to_chat_message,
     messages_from_checkpoint,
     remove_tool_calls,
+    thread_metadata_matches,
 )
 
 warnings.filterwarnings("ignore", category=LangChainBetaWarning)
@@ -104,7 +101,7 @@ async def verify_bearer(
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """
     Configurable lifespan that initializes the appropriate database checkpointer, store,
-    and agents with async loading - for example for starting up MCP clients.
+    and static agents.
     """
     try:
         app.state.auth_store = None
@@ -127,33 +124,30 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             app.state.turn_store = await stack.enter_async_context(initialize_turn_store())
             set_turn_sink(app.state.turn_store)
 
-            if not settings.AUTH_SECRET and not jwt_enabled():
-                logger.warning(
-                    "No API authentication is configured — all protected endpoints are open. "
-                    "Set JWT_SECRET to enable username login or AUTH_SECRET for legacy bearer auth."
-                )
-            if not jwt_enabled():
-                logger.warning(
-                    "JWT_SECRET is not configured — username login is disabled. "
-                    "Set JWT_SECRET to enable user authentication."
-                )
+            try:
+                if not settings.AUTH_SECRET and not jwt_enabled():
+                    logger.warning(
+                        "No API authentication is configured — all protected endpoints are open. "
+                        "Set JWT_SECRET to enable username login or AUTH_SECRET for legacy bearer auth."
+                    )
+                if not jwt_enabled():
+                    logger.warning(
+                        "JWT_SECRET is not configured — username login is disabled. "
+                        "Set JWT_SECRET to enable user authentication."
+                    )
 
-            # Configure agents with both memory components and async loading
-            agents = get_all_agent_info()
-            for a in agents:
-                try:
-                    await load_agent(a.key)
+                # Configure every registered agent before serving requests.
+                agents = get_all_agent_info()
+                for a in agents:
                     agent = get_agent(a.key)
                     # Set checkpointer for thread-scoped memory (conversation history)
                     agent.checkpointer = saver
                     # Set store for long-term memory (cross-conversation knowledge)
                     agent.store = store
                     logger.info(f"Agent loaded: {a.key}")
-                except Exception:
-                    logger.exception(f"Failed to load agent {a.key}")
-                    # Continue with other agents rather than failing startup
-            yield
-            set_turn_sink(None)
+                yield
+            finally:
+                set_turn_sink(None)
     except Exception:
         logger.exception("Error during database/store/agents initialization")
         raise
@@ -214,7 +208,7 @@ async def _handle_input(
     Parse user input and handle any required interrupt resumption.
     Returns kwargs for agent invocation, the run_id, and the resolved thread_id.
     """
-    run_id = uuid7()
+    run_id = uuid4()
     thread_id = user_input.thread_id or str(uuid4())
     user_id = authenticated_user_id or user_input.user_id or f"anonymous:{thread_id}"
 
@@ -227,22 +221,24 @@ async def _handle_input(
         ensure_model_available(user_input.model)
         configurable["model"] = user_input.model
 
-    callbacks: list[Any] = []
-
     configurable.update(user_input.agent_config)
 
     config = RunnableConfig(
         configurable=configurable,
         metadata={"user_id": user_id, "agent_id": agent_id},
         run_id=run_id,
-        callbacks=callbacks,
     )
 
     # Check for interrupts that need to be resumed
     state = await agent.aget_state(config=config)
     stored_metadata = state.metadata or {}
-    stored_user_id = stored_metadata.get("user_id")
-    if stored_user_id not in (None, user_id):
+    if not thread_metadata_matches(
+        stored_metadata,
+        expected_user_id=user_id,
+        expected_agent_id=agent_id,
+        reject_missing_user=jwt_enabled()
+        and bool(state.metadata or state.values or state.tasks or state.next),
+    ):
         raise HTTPException(status_code=404, detail="Thread not found")
 
     interrupted_tasks = [
@@ -283,8 +279,8 @@ async def invoke(
     Invoke an agent with user input to retrieve a final response.
 
     If agent_id is not provided, the default agent will be used.
-    Use thread_id to persist and continue a multi-turn conversation. run_id kwarg
-    is also attached to messages for recording feedback.
+    Use thread_id to persist and continue a multi-turn conversation. A run ID is
+    attached to messages for correlating a single request.
     Use user_id to persist and continue a conversation across multiple threads.
     """
     # NOTE: Currently this only returns the last message or interrupt.
@@ -519,30 +515,6 @@ async def stream(
     )
 
 
-@router.post("/feedback")
-async def feedback(feedback: Feedback) -> FeedbackResponse:
-    """
-    Record feedback for a run to LangSmith.
-
-    This is a simple wrapper for the LangSmith create_feedback API, so the
-    credentials can be stored and managed in the service rather than the client.
-    See: https://api.smith.langchain.com/redoc#tag/feedback/operation/create_feedback_api_v1_feedback_post
-    """
-    try:
-        client = LangsmithClient()
-        kwargs = feedback.kwargs or {}
-        client.create_feedback(
-            run_id=feedback.run_id,
-            key=feedback.key,
-            score=feedback.score,
-            **kwargs,
-        )
-    except Exception:
-        logger.exception("An exception occurred while recording feedback")
-        raise HTTPException(status_code=500, detail="Unexpected error")
-    return FeedbackResponse()
-
-
 @router.post("/{agent_id}/history", operation_id="history_with_agent_id")
 @router.post("/history")
 async def history(
@@ -557,26 +529,34 @@ async def history(
     config = RunnableConfig(configurable={"thread_id": input.thread_id})
     try:
         messages: list[BaseMessage] = []
-        stored_user_id: str | None = None
+        stored_metadata: Mapping[str, Any] = {}
+        thread_exists = False
         # Functional-API agents keep the conversation in `__previous__`, which aget_state
         # doesn't return, so read the raw checkpoint first and only fall back for graphs.
         checkpointer = getattr(agent, "checkpointer", None)
         if checkpointer:
             tup = await checkpointer.aget_tuple(config)
-            stored_user_id = (tup.metadata or {}).get("user_id") if tup else None
+            thread_exists = tup is not None
+            stored_metadata = tup.metadata or {} if tup else {}
             if tup and "__previous__" in (tup.checkpoint.get("channel_values") or {}):
                 messages = messages_from_checkpoint(tup.checkpoint)
         if not messages:
             state_snapshot = await agent.aget_state(config=config)
-            snapshot_user_id = (state_snapshot.metadata or {}).get("user_id")
-            if isinstance(snapshot_user_id, str):
-                stored_user_id = snapshot_user_id
+            thread_exists = thread_exists or bool(
+                state_snapshot.metadata
+                or state_snapshot.values
+                or state_snapshot.tasks
+                or state_snapshot.next
+            )
+            if state_snapshot.metadata:
+                stored_metadata = state_snapshot.metadata
             messages = state_snapshot.values.get("messages", [])
         expected_user_id = getattr(request.state, "auth_user_id", None) or input.user_id
-        if (
-            expected_user_id is not None
-            and stored_user_id is not None
-            and stored_user_id != expected_user_id
+        if not thread_metadata_matches(
+            stored_metadata,
+            expected_user_id=expected_user_id,
+            expected_agent_id=agent_id,
+            reject_missing_user=jwt_enabled() and thread_exists,
         ):
             raise HTTPException(status_code=404, detail="Thread not found")
         chat_messages: list[ChatMessage] = [langchain_to_chat_message(m) for m in messages]

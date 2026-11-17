@@ -4,7 +4,7 @@ Usage:
     PYTHONPATH=src uv run python evals/run_eval.py           # all cases
     PYTHONPATH=src uv run python evals/run_eval.py swap      # filter by case id
     PYTHONPATH=src uv run python evals/run_eval.py --list    # show case ids
-    PYTHONPATH=src uv run python evals/run_eval.py --budget 150000   # stop at 150k tokens
+    PYTHONPATH=src uv run python evals/run_eval.py --budget 150000   # stop before the next case after 150k tokens
 
 The score is deterministic: it checks constraint fidelity, delivery format, citation
 anchors, exclusion leaks, and whether strong trend claims have eligible structured
@@ -14,6 +14,7 @@ Every run writes `evals/runs/<timestamp>/` with one JSON per case plus `summary.
 so two runs can be compared line by line after a prompt or model change.
 """
 
+import argparse
 import asyncio
 import json
 import logging
@@ -50,6 +51,23 @@ def load_cases(selection: str | None) -> list[dict]:
     if not cases:
         raise SystemExit(f"没有匹配的用例：{selection}")
     return cases
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run the fixed research evaluation set.")
+    parser.add_argument("selection", nargs="?", help="Optional substring used to filter case ids.")
+    parser.add_argument("--list", action="store_true", help="List matching case ids and exit.")
+    parser.add_argument(
+        "--budget",
+        type=int,
+        default=0,
+        metavar="TOKENS",
+        help="Stop before starting another case after this many measured tokens.",
+    )
+    args = parser.parse_args(argv)
+    if args.budget < 0:
+        parser.error("--budget must be non-negative")
+    return args
 
 
 def estimate_cost(model: str, tokens_in: int, tokens_out: int) -> str:
@@ -184,21 +202,15 @@ def write_summary(out_dir: Path, records: list[dict], model: str) -> str:
 async def main() -> None:
     load_dotenv(".env", override=True)
     logging.basicConfig(level=settings.LOG_LEVEL.to_logging_level())
-    args = [arg for arg in sys.argv[1:] if not arg.startswith("-")]
-    cases = load_cases(args[0] if args else None)
+    args = parse_args(sys.argv[1:])
+    cases = load_cases(args.selection)
 
-    if "--list" in sys.argv:
+    if args.list:
         for case in cases:
             print(f"{case['id']:24} {case['title']}")
         return
 
-    budget = 0
-    for flag in sys.argv[1:]:
-        if flag.startswith("--budget="):
-            budget = int(flag.split("=", 1)[1])
-    if "--budget" in sys.argv:
-        budget = int(sys.argv[sys.argv.index("--budget") + 1])
-
+    budget = args.budget
     model = str(settings.DEFAULT_MODEL.value if settings.DEFAULT_MODEL else "")
     if not model:
         raise SystemExit("未配置 DEFAULT_MODEL")
@@ -232,6 +244,11 @@ async def main() -> None:
     summary = write_summary(out_dir, records, model)
     print()
     print(summary)
+    if any(
+        record["error"] or any(not check["passed"] for check in record["checks"])
+        for record in records
+    ):
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

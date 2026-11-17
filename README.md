@@ -94,18 +94,17 @@ USE_FAKE_MODEL=true uv run python src/run_service.py
 | `DASHSCOPE_ENABLE_THINKING` | 百炼托管模型是否开启思考；DeepSeek V4.1 下必须关闭（开启后会在补全上限内耗尽预算） | `false` |
 | `LLM_MAX_TOKENS` | 单次补全上限；开思考时须同时容纳思考与可见正文 | `16384` |
 | `DEFAULT_MODEL` | 覆盖默认模型。百炼侧：`deepseek-v4.1-flash` / `deepseek-v4.1-flash-1017` / `qwen3.8-27b`；DeepSeek 直连：`deepseek-flash` / `deepseek-v4-pro`；另有 OpenAI 与 `fake`。必须是已配置 provider 的模型，否则启动即报错并指出缺哪个 key | 按 key 选择：百炼 → `deepseek-v4.1-flash-1017`，DeepSeek → `deepseek-flash` |
-| `OPENAI_API_KEY` | OpenAI 直连模型（可选），同时是语音功能的凭据 | 空 |
+| `OPENAI_API_KEY` | OpenAI 直连模型（可选） | 空 |
 | `COMPATIBLE_BASE_URL` / `COMPATIBLE_MODEL` | 任意 OpenAI 兼容网关（vLLM / SGLang / 内部网关） | 空 |
 | `AUTH_SECRET` | 兼容旧版 Bearer token；未设置 JWT 时生效，`/health` 与 `/auth/*` 不受其保护 | 空 |
 | `JWT_SECRET` | 用户登录签名密钥；设置后要求 PostgreSQL，并启用用户名登录与 HttpOnly Cookie | 空 |
 | `JWT_ACCESS_TTL_MINUTES` / `JWT_REFRESH_TTL_DAYS` | Access / Refresh Cookie 有效期 | `15` / `30` |
-| `AUTH_COOKIE_SECURE` | 是否只通过 HTTPS 发送认证 Cookie | `false` |
+| `AUTH_COOKIE_SECURE` | 是否只通过 HTTPS 发送认证 Cookie | `true` |
 | `HOST` / `PORT` / `MODE` | 监听地址、端口；`MODE=dev` 开启热重载 | `0.0.0.0` / `8080` / 空 |
 | `FORWARDED_ALLOW_IPS` | 信任的代理 IP（`X-Forwarded-*`）。反向代理（Render / nginx / Docker）后必须设为 `*` 或代理网段，否则请求 scheme 仍是内部 HTTP，Cookie 鉴权的 Origin 校验会拒绝所有 HTTPS POST | `127.0.0.1` |
 | `LOG_LEVEL` | 日志级别；指标行与 token 归因分别是 INFO / DEBUG，默认级别下不输出 | `WARNING` |
-| `DATABASE_TYPE` | `sqlite` / `postgres` / `mongo` | `sqlite` |
+| `DATABASE_TYPE` | `postgres` / `sqlite` / `mongo` | `postgres` |
 | `USE_FAKE_MODEL` | 使用假模型验证链路 | `false` |
-| `VOICE_STT_PROVIDER` / `VOICE_TTS_PROVIDER` | 语音识别 / 合成提供方，当前仅实现 `openai`；留空即关闭 | 空 |
 
 ## API
 
@@ -118,7 +117,6 @@ USE_FAKE_MODEL=true uv run python src/run_service.py
 | `GET /{agent_id}/threads` | 列出当前登录用户的历史会话，最近更新在前 |
 | `POST /auth/register` / `POST /auth/login` | 注册或登录；认证状态写入 HttpOnly Cookie |
 | `POST /auth/refresh` / `POST /auth/logout` / `GET /auth/me` | 刷新、退出、读取当前用户 |
-| `POST /feedback` | 星级反馈（LangSmith） |
 | `POST /agui/{agent_id}/run` | AG-UI 协议端点，SSE；`/agui/run` 走默认 agent |
 | `GET /health` | 健康检查，唯一不经过 bearer 鉴权的端点 |
 
@@ -149,8 +147,6 @@ src/
 │   │   ├── helpers.py        # 去重、结构化输出、置信度归一化等共用逻辑
 │   │   └── graph.py          # 图组装
 │   ├── agents.py             # agent 注册表
-│   ├── lazy_agent.py         # 需要异步初始化的 agent 基类（当前注册的 agent 未使用）
-│   ├── tools.py              # 共享工具
 │   └── utils.py              # 消息与回调辅助
 ├── core/                     # settings.py、llm.py（模型工厂）、metrics.py（请求级计数）
 ├── memory/                   # checkpointer 与 store 后端：sqlite / postgres / mongodb
@@ -158,10 +154,9 @@ src/
 ├── service/                  # service.py（路由与鉴权）、agui.py、threads.py、utils.py
 ├── client/                   # 通用 AgentClient，同步与异步两套调用
 ├── evaluation/               # 评估用确定性评分器
-├── voice/                    # 可选语音底层：stt.py / tts.py 工厂、providers/
 ├── run_service.py            # 启动服务
 ├── run_agent.py              # 命令行直接运行图
-└── run_client.py             # 客户端用法示例
+└── run.py                   # 客户端用法示例
 ```
 
 | 包 | 职责 | 关键约束 |
@@ -173,7 +168,6 @@ src/
 | `memory/` | 三套持久化后端 | 切换只改 `DATABASE_TYPE`，业务代码不感知 |
 | `schema/` | 对外协议模型 | 服务端、客户端、界面共用同一套定义 |
 | `evaluation/` | 评估判据 | 做确定性结构与趋势证据检查，不评判分析质量 |
-| `voice/` | STT/TTS 抽象与 provider | 可独立使用，服务端不感知；当前无界面集成 |
 
 `research_team` 内部按依赖方向组织：`graph.py` 只负责节点装配；节点读取并返回
 `ResearchState` 的增量更新；`contracts.py` 定义跨节点共享的领域对象；`search.py`
@@ -187,7 +181,7 @@ Writer(report) → finalize(messages)`，节点之间不直接调用彼此。
 static/    # 纯静态项目展示页（HTML / CSS / JS），可独立部署到静态托管
   js/evaluation-data.js  # 只读离线评测快照；不作为线上运行数据
   js/runtime-records.js  # /runtime-metrics 响应归一化与真实运行记录边界
-evals/     # 5 个用例、评分脚本、Writer A/B 脚本与 runs/ 历史记录
+evals/     # 5 个用例、评分脚本与 runs/ 历史记录
 tests/     # pytest，按包分层，含 service 的端到端与 smoke 持久化用例
 scripts/   # ab_bench.py、AG-UI 演示客户端（Node）
 docs/      # AG-UI 接入说明、文件式凭据说明
@@ -203,7 +197,7 @@ uv run pyrefly check
 uv run pytest
 ```
 
-`tests/` 与 `src/` 的包一一对应（agents / client / core / evaluation / schema / service / voice），
+`tests/` 与 `src/` 的包一一对应（agents / client / core / evaluation / schema / service），
 另有 `tests/integration` 与 `tests/smoke` 两组需要运行中服务的用例，默认跳过，加 `--run-docker` 才执行
 （这两个目录复用 `USE_FAKE_MODEL=true` 与服务端配置，`smoke` 还会校验 checkpoint 确实落到当前
 `DATABASE_TYPE` 对应的后端）。
@@ -243,8 +237,8 @@ Search 会同时返回同一篇文章的简繁体版本（`/cn/`、`/tw/`）与�
 
 | 后端 | 配置 | 说明 |
 |---|---|---|
-| SQLite | `DATABASE_TYPE=sqlite` | 默认，单文件，适合单机 |
-| PostgreSQL | `DATABASE_TYPE=postgres` + `POSTGRES_*` | 本机用 `docker compose up -d postgres` 即可 |
+| PostgreSQL | `DATABASE_TYPE=postgres` + `POSTGRES_*` | 默认；本机用 `docker compose up -d postgres` 即可 |
+| SQLite | `DATABASE_TYPE=sqlite` | 显式切换，单文件，适合临时单机运行 |
 | MongoDB | `DATABASE_TYPE=mongo` + `MONGO_*` | 仅 checkpoint；长期记忆 store 暂回退到进程内存储 |
 
 当前使用 PostgreSQL 16（本机 Docker，`agent_service` 库），checkpoint 落在 `checkpoints` /
@@ -258,19 +252,6 @@ PostgreSQL 重启后保留，MongoDB 回退到进程内统计（重启清零）�
 **Windows 注意**：psycopg 的异步模式不能跑在 Proactor 事件循环上，而 uvicorn 0.54 在
 Windows 上硬编码 Proactor。`run_service.py` 已在「Windows + PostgreSQL」时改为手动构造
 `uvicorn.Server` 并以 Selector 循环运行，代价是这条路径上没有热重载。
-
-## 语音（可选）
-
-`voice/` 提供可独立使用的 STT / TTS 抽象与 OpenAI provider 实现，不依赖界面框架，服务端对它无感知。当前项目没有界面集成，留作后续接入使用。
-
-| 变量 | 作用 | 当前支持 |
-|---|---|---|
-| `VOICE_STT_PROVIDER` | 语音识别 | 仅 `openai`（`deepgram` 有类型定义，调用会抛 `NotImplementedError`） |
-| `VOICE_TTS_PROVIDER` | 语音合成 | 仅 `openai`（`elevenlabs` 同上） |
-
-- 两者留空即关闭。
-- `SpeechToText` / `TextToSpeech` 可单独使用，各自通过环境变量选择 provider。
-- provider 初始化失败只记日志并降级，不会让服务起不来——语音是能少不能崩的旁路。
 
 ## 评估
 
@@ -301,12 +282,6 @@ PYTHONPATH=src uv run python evals/run_eval.py catl     # 按 id 过滤
 2026-11-16 加入 `trend` 判据后，全量总判据为 41，
 历史 runs 为 32 判据，跨版本对比先核对判据数。成本列按仓库价表估算，只含 LLM token、不含
 Search/Fetch 费用；`-1017` 这类快照后缀按基础模型计价，未知模型显示 `—`。
-
-Writer 上下文的对照实验单独跑，结果写到 `evals/ab_writer_<时间戳>.json`，不进 `runs/`：
-
-```sh
-PYTHONPATH=src uv run python evals/ab_writer.py
-```
 
 基线（2026-11-14T14:04 全量运行，`deepseek-v4.1-flash-1017` 关闭思考，Writer 不接收原文摘录）：
 **32/32（100%）**，四个调研用例单轮输入 19k–28k token、耗时 24–46s，负样本 0.8s / 600 token

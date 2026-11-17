@@ -22,8 +22,10 @@ from fastapi.responses import StreamingResponse
 from langchain_core.runnables import RunnableConfig
 
 from agents import DEFAULT_AGENT, AgentGraph, get_agent
+from auth.security import jwt_enabled
 from core.metrics import begin_turn, end_turn, record_result
-from service.utils import ensure_model_available
+from schema.schema import validate_agent_config_size, validate_identifier
+from service.utils import ensure_model_available, thread_metadata_matches
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +51,11 @@ def _base_config(
     configurable = forwarded.get("configurable") or {}
     if not isinstance(configurable, dict):
         raise HTTPException(status_code=422, detail="forwardedProps.configurable must be an object")
+    try:
+        validate_agent_config_size(configurable)
+        validate_identifier(input_data.thread_id, "thread_id")
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     if overlap := RESERVED_CONFIGURABLE_KEYS & configurable.keys():
         raise HTTPException(
             status_code=422,
@@ -62,6 +69,12 @@ def _base_config(
     if authenticated_user_id is not None:
         configurable["user_id"] = authenticated_user_id
     user_id = configurable.setdefault("user_id", f"anonymous:{input_data.thread_id}")
+    if not isinstance(user_id, str):
+        raise HTTPException(status_code=422, detail="user_id must be a string")
+    try:
+        validate_identifier(user_id, "user_id")
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     context_mode = configurable.setdefault("context_mode", "fresh")
     if context_mode not in {"fresh", "reuse"}:
         raise HTTPException(
@@ -158,7 +171,13 @@ async def agui_run(
     # inside the streaming generator would reach the client as a truncated 200 stream.
     state = await graph.aget_state(config=config)
     metadata = state.metadata or {}
-    if metadata.get("user_id") not in (None, config["configurable"]["user_id"]):
+    if not thread_metadata_matches(
+        metadata,
+        expected_user_id=config["configurable"]["user_id"],
+        expected_agent_id=agent_id,
+        reject_missing_user=jwt_enabled()
+        and bool(state.metadata or state.values or state.tasks or state.next),
+    ):
         raise HTTPException(status_code=404, detail="Thread not found")
     encoder = EventEncoder(accept=request.headers.get("accept", ""))
     return StreamingResponse(

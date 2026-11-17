@@ -171,7 +171,9 @@ def test_agui_no_raw_events(mock_agui_agent, test_client) -> None:
 def test_agui_default_agent_route(mock_agui_agent, test_client) -> None:
     """POST /agui/run falls back to the default agent."""
     with patch("service.agui.get_agent", return_value=model_agent) as mock_get_agent:
-        events = collect_events(test_client, "/agui/run", run_input())
+        events = collect_events(
+            test_client, "/agui/run", run_input(thread_id="default-agent-thread")
+        )
     from agents import DEFAULT_AGENT
 
     mock_get_agent.assert_called_once_with(DEFAULT_AGENT)
@@ -201,6 +203,25 @@ def test_agui_rejects_invalid_context_mode(mock_agui_agent, test_client) -> None
 
     assert response.status_code == 422
     assert "context_mode" in response.json()["detail"]
+
+
+@pytest.mark.parametrize("thread_id", ["has space", "line\nbreak", "中文"])
+def test_agui_rejects_unsafe_thread_id(mock_agui_agent, test_client, thread_id) -> None:
+    response = test_client.post("/agui/model-agent/run", json=run_input(thread_id))
+
+    assert response.status_code == 422
+    assert "thread_id" in response.json()["detail"]
+
+
+def test_agui_rejects_oversized_forwarded_config(mock_agui_agent, test_client) -> None:
+    body = run_input(
+        forwardedProps={"configurable": {"value": "a" * 32_768}},
+    )
+
+    response = test_client.post("/agui/model-agent/run", json=body)
+
+    assert response.status_code == 422
+    assert "32768 UTF-8 bytes" in response.json()["detail"]
 
 
 def test_agui_jwt_identity_overrides_client_user_id(

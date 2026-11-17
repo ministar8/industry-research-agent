@@ -16,8 +16,6 @@ STYLE_AUDIT = """() => {
   return {minimumFont: Math.min(...sizes), weights, overflow: document.querySelector('#mainContent').scrollWidth > document.querySelector('#mainContent').clientWidth, viewport: innerWidth};
 }"""
 
-EMPTY_DATA_JS = "export const PORTFOLIO_DATA = {run:{}, cases: []};\nexport const RECORD_LABELS = {};\nexport const DATA = PORTFOLIO_DATA;\nexport function label(){return ['','','',''];}\nexport function isNegative(){return false;}\n"
-
 
 class Handler(SimpleHTTPRequestHandler):
     def log_message(self, *args):
@@ -30,9 +28,9 @@ def main():
     threading.Thread(target=server.serve_forever, daemon=True).start()
     base = f"http://127.0.0.1:{server.server_port}"
     checks, errors, audits, calls = [], [], [], []
-    raw = (ROOT / "static/js/data.js").read_text(encoding="utf-8")
+    raw = (ROOT / "static/js/evaluation-data.js").read_text(encoding="utf-8")
     data = json.loads(raw[raw.index("{") : raw.index("};") + 1])
-    scenario = {"mode": "ok"}
+    scenario = {"mode": "unauthorized"}
 
     def mock_api(route):
         path = route.request.url.removeprefix(base)
@@ -97,33 +95,17 @@ def main():
         page.locator("#closeConnection").click()
         checks.append("empty input, prompt fill, disconnected and unauthorized states")
         page.locator(".primary-nav a[href='#data']").click()
-        expect(page.locator("#recordsBody tr")).to_have_count(5)
-        expect(page.locator("#summaryMetrics")).to_contain_text("36 / 36")
-        expect(page.locator("#summaryMetrics")).to_contain_text("53")
-        expect(page.locator("#summaryMetrics")).to_contain_text("¥0.51")
-        expect(page.locator("#durationChart")).to_contain_text("78.4")
+        expect(page.locator("#recordsBody tr")).to_have_count(1)
+        expect(page.locator("#recordsBody")).to_contain_text("暂无真实运行记录")
+        expect(page.locator("#durationChart")).to_contain_text("连接服务并完成一次调研后显示")
         page.locator("#toast").wait_for(state="hidden")
         page.screenshot(path=OUT / "after-data.png")
-        page.locator("#recordSearch").fill("不存在的企业")
-        expect(page.locator("#recordsBody")).to_contain_text("没有匹配")
-        expect(page.locator("#summaryMetrics")).to_contain_text("0 / 0")
-        page.locator("#recordSearch").fill("")
-        page.locator("#recordFilter").select_option("negative")
-        expect(page.locator("#recordsBody tr")).to_have_count(1)
-        expect(page.locator("#recordsBody")).to_contain_text("1 次")
         with page.expect_download() as event:
             page.locator("#exportData").click()
         event.value.save_as(OUT / "filtered.csv")
         with (OUT / "filtered.csv").open(encoding="utf-8-sig", newline="") as file:
-            assert len(list(csv.reader(file))) == 2
-        page.locator("#recordFilter").select_option("all")
-        page.locator("#sortDuration").click()
-        expect(page.locator("#recordsBody tr").first).to_contain_text("无调研对象")
-        page.locator("#sortDuration").click()
-        expect(page.locator("#recordsBody tr").first).to_contain_text("78.4")
-        checks.append(
-            "data totals, honest negative sample, search, empty state, sorting, filtered CSV"
-        )
+            assert len(list(csv.reader(file))) == 1
+        checks.append("live data empty state and header-only CSV export")
         for index, record in enumerate(data["cases"]):
             page.goto(base + "#record/" + record["id"])
             expect(page.locator("#reportView")).to_be_visible()
@@ -164,6 +146,7 @@ def main():
         )
         scenario["mode"] = "ok"
         page.locator("#openConnection").click()
+        page.locator("#connectionDialog details summary").click()
         page.locator("#serviceToken").fill("test-only-token")
         page.locator("#connectService").click()
         expect(page.locator("#connectionLabel")).to_have_text("服务已连接")
@@ -226,16 +209,6 @@ def main():
         checks.append(
             "single-byte UTF-8 chunks, CRLF SSE framing, stop-waiting with billing caveat"
         )
-        empty_page = context.new_page()
-        empty_page.route(
-            "**/js/data.js",
-            lambda route: route.fulfill(content_type="text/javascript", body=EMPTY_DATA_JS),
-        )
-        empty_page.goto(base)
-        expect(empty_page.locator("#homeView")).to_contain_text("评估数据未加载")
-        expect(empty_page.locator("#composer")).to_be_hidden()
-        empty_page.close()
-        checks.append("missing dataset shows an explicit empty state")
         assert not errors, errors
         browser.close()
     server.shutdown()

@@ -9,7 +9,6 @@ from schema import (
     ChatHistory,
     ChatHistoryInput,
     ChatMessage,
-    Feedback,
     ServiceMetadata,
     StreamInput,
     UserInput,
@@ -186,7 +185,14 @@ class AgentClient:
                 parsed = json.loads(data)
             except Exception as e:
                 raise AgentClientError(f"Error JSON parsing message from server: {e}")
-            match parsed["type"]:
+            if not isinstance(parsed, dict):
+                raise AgentClientError("Server returned an invalid event.")
+            event_type = parsed.get("type")
+            if event_type not in {"message", "token", "error"}:
+                raise AgentClientError("Server returned an invalid event type.")
+            if "content" not in parsed:
+                raise AgentClientError("Server returned an event without content.")
+            match event_type:
                 case "message":
                     # Convert the JSON formatted message to an AnyMessage
                     try:
@@ -194,9 +200,13 @@ class AgentClient:
                     except Exception as e:
                         raise AgentClientError(f"Server returned invalid message: {e}")
                 case "token":
+                    if not isinstance(parsed["content"], str):
+                        raise AgentClientError("Server returned an invalid token.")
                     # Yield the str token directly
                     return parsed["content"]
                 case "error":
+                    if not isinstance(parsed["content"], str):
+                        raise AgentClientError("Server returned an invalid error message.")
                     error_msg = "Error: " + parsed["content"]
                     return ChatMessage(type="ai", content=error_msg)
         return None
@@ -317,30 +327,6 @@ class AgentClient:
                             # Don't yield empty string tokens as they cause generator issues
                             if parsed != "":
                                 yield parsed
-            except httpx.HTTPError as e:
-                raise AgentClientError(f"Error: {e}")
-
-    async def acreate_feedback(
-        self, run_id: str, key: str, score: float, kwargs: dict[str, Any] | None = None
-    ) -> None:
-        """
-        Create a feedback record for a run.
-
-        This is a simple wrapper for the LangSmith create_feedback API, so the
-        credentials can be stored and managed in the service rather than the client.
-        See: https://api.smith.langchain.com/redoc#tag/feedback/operation/create_feedback_api_v1_feedback_post
-        """
-        request = Feedback(run_id=run_id, key=key, score=score, kwargs=kwargs or {})
-        async with httpx.AsyncClient() as client:
-            try:
-                response = await client.post(
-                    f"{self.base_url}/feedback",
-                    json=request.model_dump(),
-                    headers=self._headers,
-                    timeout=self.timeout,
-                )
-                response.raise_for_status()
-                response.json()
             except httpx.HTTPError as e:
                 raise AgentClientError(f"Error: {e}")
 
