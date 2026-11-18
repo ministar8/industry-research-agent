@@ -26,6 +26,7 @@ class DashScopeModelName(StrEnum):
     DEEPSEEK_V41_FLASH = "deepseek-v4.1-flash"
     DEEPSEEK_V41_FLASH_1017 = "deepseek-v4.1-flash-1017"
     QWEN_38_27B = "qwen3.8-27b"
+    QWEN_4_MAX = "qwen4-max"
 
 
 class DeepseekModelName(StrEnum):

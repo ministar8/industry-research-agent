@@ -37,11 +37,13 @@ ROOT = Path(__file__).resolve().parent
 CASES = ROOT / "cases.json"
 
 # Per-million-token prices in USD. Unknown models report no cost rather than a guess.
+USD_TO_CNY = 7.2
 PRICE_PER_MTOK = {
     "deepseek-v4.1-flash": (0.424, 1.696),
     "deepseek-flash": (0.15, 0.60),
+    # DashScope Beijing list price: ¥10 in / ¥30 out per Mtok, thinking included.
+    "qwen4-max": (10 / USD_TO_CNY, 30 / USD_TO_CNY),
 }
-USD_TO_CNY = 7.2
 
 
 def load_cases(selection: str | None) -> list[dict]:
