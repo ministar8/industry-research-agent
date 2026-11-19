@@ -64,7 +64,7 @@
 Provider and measurement facts that are not derivable from the code. Check them before
 "simplifying" any of these paths.
 
-- `structured_output()` in `research_team/helpers.py` tries `response_format: json_schema`
+- `structured_output()` in `research_team/structured.py` tries `response_format: json_schema`
   first, falling back to `json_mode` only on a 400/422 naming `response_format`. DashScope
   accepts strict decoding; DeepSeek's own endpoint returns `This response_format type is
   unavailable now`, and forced `tool_choice` is rejected under thinking mode. Capability is

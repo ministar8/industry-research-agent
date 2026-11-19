@@ -2,6 +2,7 @@ from functools import cache
 from typing import Any
 
 from langchain_core.language_models.fake_chat_models import FakeListChatModel
+from langchain_core.runnables import RunnableConfig
 from langchain_openai import ChatOpenAI
 
 from core.settings import settings
@@ -94,3 +95,12 @@ def get_model(model_name: AllModelEnum, /) -> ModelT:
         return FakeToolModel(responses=["This is a test response from the fake model."])
 
     raise ValueError(f"Unsupported model: {model_name}")
+
+
+def resolve_model(config: RunnableConfig | None = None) -> ModelT:
+    """Pick the model for one call: the request override wins over the default."""
+    configured = config.get("configurable", {}).get("model") if config else None
+    model_name: AllModelEnum | None = configured or settings.DEFAULT_MODEL
+    if model_name is None:
+        raise ValueError("No default model configured")
+    return get_model(model_name)

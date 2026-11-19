@@ -11,18 +11,19 @@ from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, Field
 
 from agents.research_team.contracts import Source
-from agents.research_team.helpers import (
+from agents.research_team.prompts import load_prompt, render_prompt
+from agents.research_team.search import SearchRejected, fetch, is_fetchable, search
+from agents.research_team.sources import (
+    clean_fetched_markdown,
     clean_title,
     clean_url,
     confidence_from_authority,
     dedupe_sources,
-    resolve_model,
-    structured_output,
     url_key,
 )
-from agents.research_team.search import SearchRejected, fetch, is_fetchable, search
 from agents.research_team.state import ResearchState
-from core import settings
+from agents.research_team.structured import structured_output
+from core import resolve_model, settings
 from core.metrics import record_degradation, record_fetch, record_filter, record_search
 
 logger = logging.getLogger(__name__)
@@ -38,23 +39,16 @@ MAX_RAW_EXCERPT = 400
 MAX_QUERY_CHARS = 128
 FALLBACK_MIN_AUTHORITY = 2
 FALLBACK_MIN_RERANK = 1.5
-FALLBACK_REASON = "评分阈值降级（相关性判定不可用）"
 
 # Query plans and relevance judgements are small outputs; cap them so a degenerate
 # runaway generation dies cheap instead of burning the full shared LLM_MAX_TOKENS.
 QUERY_PLAN_MAX_TOKENS = 2048
 JUDGE_MAX_TOKENS = 4096
 
-RESEARCHER_PROMPT = """你是行业与竞品调研团队的检索员。你只做一件事：针对分配到的子问题采集原始素材，
-并如实记录来源。你不下结论，也不写报告。
-
-采集要求：
-- 优先采集可验证的事实：数据、公告、财报、政策文件、产品参数、市场份额、价格。
-- 每条 query 必须具体，带上年份、地区、公司名或产品名，且不超过 100 个字符。
-- 严格围绕给定子问题检索，不要因为用户描述里的背景信息扩大范围。
-
-来源可信度由检索接口自带：authority（-1 未知，3 以上为高权威）与 rerank_score
-（0-3，1.5 以上为高质量）。你不需要自己给来源打分，只需要判断相关性。"""
+RESEARCHER_PROMPT = load_prompt("research_team.researcher.instructions")
+_TASK_BRIEF_PROMPT = load_prompt("research_team.researcher.task_brief")
+_JUDGE_BRIEF_PROMPT = load_prompt("research_team.researcher.judge_brief")
+_JUDGE_RESULTS_PROMPT = load_prompt("research_team.researcher.judge_results")
 
 
 class QueryPlan(BaseModel):
@@ -64,9 +58,10 @@ class QueryPlan(BaseModel):
 
 
 class SourceJudgement(BaseModel):
+    # Only the verdict is read; a "reason" field here cost ~400 output tokens per
+    # judgement round and was discarded by every consumer.
     url: str
     keep: bool = Field(description="与子问题直接相关且内容有效则保留")
-    reason: str = Field(default="", description="一句话判定理由")
 
 
 class SourceJudgements(BaseModel):
@@ -93,21 +88,17 @@ def _task_brief(state: ResearchState) -> str:
             last_user = str(message.content)
             break
     excerpt = last_user[:MAX_RAW_EXCERPT] + ("…" if len(last_user) > MAX_RAW_EXCERPT else "")
-    return f"""本轮意图：{state.get("intent") or "（未解析）"}
-待调研子问题：
-{questions}
-
-研究对象（每个主要对象都必须覆盖）：
-{subject_lines}
-
-必须遵守的范围与交付约束：
-{constraints}
-
-已采集过的来源（不要重复）：
-{known_urls}
-
-用户原始描述（节选，仅供参考，不得据此增减子问题，也不得把无关内容当作检索目标）：
-{excerpt}"""
+    return str(
+        render_prompt(
+            _TASK_BRIEF_PROMPT,
+            intent=state.get("intent") or "（未解析）",
+            questions=questions,
+            subjects=subject_lines,
+            constraints=constraints,
+            known_urls=known_urls,
+            excerpt=excerpt,
+        )[0].content
+    )
 
 
 def _judge_brief(state: ResearchState) -> str:
@@ -115,11 +106,13 @@ def _judge_brief(state: ResearchState) -> str:
     tasks = state.get("tasks") or []
     questions = "\n".join(f"- {t.question}" for t in tasks) or "- （未拆解）"
     constraints = "\n".join(f"- {c}" for c in state.get("constraints") or []) or "（无）"
-    return f"""本轮调研任务：
-{questions}
-
-必须遵守的范围与交付约束：
-{constraints}"""
+    return str(
+        render_prompt(
+            _JUDGE_BRIEF_PROMPT,
+            questions=questions,
+            constraints=constraints,
+        )[0].content
+    )
 
 
 def _fallback_queries(state: ResearchState) -> list[str]:
@@ -139,10 +132,7 @@ async def _plan_queries(state: ResearchState, config: RunnableConfig) -> list[st
     try:
         model: Any = resolve_model(config)
         planner = structured_output(model, QueryPlan, "planner", max_tokens=QUERY_PLAN_MAX_TOKENS)
-        messages = [
-            SystemMessage(content=RESEARCHER_PROMPT),
-            SystemMessage(content=_task_brief(state)),
-        ]
+        messages = render_prompt(RESEARCHER_PROMPT) + [SystemMessage(content=_task_brief(state))]
         plan: QueryPlan = await planner.ainvoke(messages)
     except Exception as exc:
         logger.warning("Query planning failed, using task text instead: %s", exc)
@@ -176,21 +166,18 @@ async def _judge(
     try:
         model: Any = resolve_model(config)
         judge = structured_output(model, SourceJudgements, "judge", max_tokens=JUDGE_MAX_TOKENS)
-        messages = [
-            SystemMessage(content=RESEARCHER_PROMPT),
-            SystemMessage(content=_judge_brief(state)),
-            SystemMessage(
-                content="下面是候选检索结果，请逐条判断是否与任务直接相关。"
-                "不需要评估可信度，接口已提供 authority 与 rerank_score。\n\n" + listing
-            ),
-        ]
+        messages = (
+            render_prompt(RESEARCHER_PROMPT)
+            + [SystemMessage(content=_judge_brief(state))]
+            + render_prompt(_JUDGE_RESULTS_PROMPT, listing=listing)
+        )
         return await judge.ainvoke(messages)
     except Exception as exc:
         logger.warning("Relevance judgement failed, falling back to score thresholds: %s", exc)
         record_degradation("judge_fallback")
         return SourceJudgements(
             sources=[
-                SourceJudgement(url=candidate["url"], keep=True, reason=FALLBACK_REASON)
+                SourceJudgement(url=candidate["url"], keep=True)
                 for candidate in candidates
                 if _score_passes_threshold(candidate)
             ]
@@ -336,7 +323,7 @@ async def _deep_read(sources: list[Source]) -> int:
             raise page
         if not page:
             continue
-        source.content = page["content"][:MAX_CONTENT_CHARS]
+        source.content = clean_fetched_markdown(page["content"])[:MAX_CONTENT_CHARS]
         fetched += 1
     return fetched
 

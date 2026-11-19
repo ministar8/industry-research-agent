@@ -20,9 +20,32 @@ function addQuestion(text) {
   const node = document.createElement('p'); node.className = 'chat-question'; node.textContent = text;
   $('chatMessages').append(node);
 }
+/* 成稿报告按 ## 分段：对话流里只展示摘要与主要发现，其余段落折叠；
+   非成稿输出（引导提示、阶段性分析、失败说明）没有这两段，保持全文展示。 */
+function splitReport(report) {
+  const sections = []; let preamble = '';
+  for (const line of report.split('\n')) {
+    const heading = /^##\s+(.+?)\s*$/.exec(line);
+    if (heading) sections.push({ title: heading[1], lines: [line] });
+    else if (sections.length) sections.at(-1).lines.push(line);
+    else preamble += line + '\n';
+  }
+  const brief = sections.filter((s) => s.title === '摘要' || s.title === '主要发现');
+  if (brief.length < 2) return null;
+  const rest = sections.filter((s) => !brief.includes(s));
+  if (!rest.length) return null;
+  return {
+    lead: [preamble.trimEnd(), ...brief.map((s) => s.lines.join('\n'))].join('\n\n'),
+    rest: rest.map((s) => s.lines.join('\n')).join('\n\n'),
+    restTitles: rest.map((s) => s.title).join('、'),
+  };
+}
 function answerCard(answer, prefix) {
   const { report, sources } = parseAnswer(answer);
-  return `<article class="chat-answer"><p class="section-kicker">调研结果 · 服务返回</p><h2 class="signature">研究结果</h2><div class="markdown">${markdown(report, sources, prefix)}</div></article>`;
+  const split = splitReport(report);
+  const head = `<p class="section-kicker">调研结果 · 服务返回</p><h2 class="signature">研究结果</h2>`;
+  if (!split) return `<article class="chat-answer">${head}<div class="markdown">${markdown(report, sources, prefix)}</div></article>`;
+  return `<article class="chat-answer">${head}<div class="markdown">${markdown(split.lead, sources, prefix)}</div><details class="chat-answer-rest"><summary>展开完整报告 · ${esc(split.restTitles)}</summary><div class="markdown">${markdown(split.rest, sources, prefix)}</div></details></article>`;
 }
 function addAnswer(text) {
   const prefix = `chat-${++state.sequence}`;

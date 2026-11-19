@@ -28,7 +28,7 @@ from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage
 
 from agents.research_team.graph import research_supervisor
-from agents.research_team.helpers import dedupe_sources
+from agents.research_team.sources import dedupe_sources
 from core import settings
 from core.metrics import begin_turn, current, end_turn
 from evaluation.scoring import CheckResult, run_checks

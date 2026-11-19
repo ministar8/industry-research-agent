@@ -71,6 +71,9 @@
 .chat-process { margin-bottom: 12px; font-size: var(--fs-caption); color: var(--ink-3); }
 .chat-process summary { cursor: pointer; }
 .chat-process p { margin-top: 6px; overflow-wrap: anywhere; }
+.chat-answer-rest { margin-top: 4px; border-top: 1px solid var(--rule); padding-top: 12px; }
+.chat-answer-rest summary { cursor: pointer; font-size: var(--fs-small); color: var(--ink-2); }
+.chat-answer-rest .markdown { margin-top: 12px; }
 
 /* 对话页右侧来源栏 */
 .chat-sources-panel { border-left: 1px solid var(--rule); display: flex; flex-direction: column; min-height: 0; }

@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.prompts import ChatPromptTemplate
 from openai import LengthFinishReasonError
 
 from agents.research_team.analyst import (
@@ -16,21 +17,14 @@ from agents.research_team.analyst import (
     _normalize_subject_coverage,
     analyst,
 )
-from agents.research_team.helpers import (
-    EXCERPT_CHARS,
-    clamp_anchors,
-    clean_url,
-    confidence_from_authority,
-    dedupe_sources,
-    excerpt,
-    inline_schema,
-    numbered_sources,
-    structured_output,
-    url_key,
+from agents.research_team.prompts import (
+    PROMPTS_DIR,
+    read_prompt,
+    render_prompt,
 )
 from agents.research_team.researcher import (
-    FALLBACK_REASON,
     MAX_CANDIDATES,
+    MAX_CONTENT_CHARS,
     SourceJudgements,
     _candidate,
     _deep_read,
@@ -41,6 +35,17 @@ from agents.research_team.researcher import (
     researcher,
 )
 from agents.research_team.search import SearchRejected, SearchResponseError, fetch, search
+from agents.research_team.sources import (
+    EXCERPT_CHARS,
+    clamp_anchors,
+    clean_fetched_markdown,
+    clean_url,
+    confidence_from_authority,
+    dedupe_sources,
+    excerpt,
+    numbered_sources,
+    url_key,
+)
 from agents.research_team.state import (
     AspectCoverage,
     EvidenceCoverage,
@@ -50,7 +55,9 @@ from agents.research_team.state import (
     Source,
     SubjectEvidenceCoverage,
 )
+from agents.research_team.structured import inline_schema, structured_output
 from agents.research_team.supervisor import (
+    MAX_ROUNDS,
     RoutingDecision,
     _enforce,
     finalize,
@@ -62,6 +69,7 @@ from agents.research_team.writer import (
     TableBlock,
     TableRequiredReport,
     _is_complete,
+    _render_subject_coverage,
     render_report,
     report_schema,
     requires_table,
@@ -277,7 +285,7 @@ def test_route_returns_recorded_action():
 
 
 def test_route_forces_finalize_past_round_limit():
-    assert route({"next_action": "researcher", "rounds": 9, "max_rounds": 8}) == "finalize"
+    assert route({"next_action": "researcher", "rounds": MAX_ROUNDS + 1}) == "finalize"
 
 
 def test_route_defaults_to_finalize_without_action():
@@ -1448,12 +1456,141 @@ async def test_judge_falls_back_to_score_thresholds_on_llm_failure():
 
     kept = [item.url for item in result.sources]
     assert kept == ["https://high.example/1", "https://medium.example/1"]
-    assert all(item.reason == FALLBACK_REASON for item in result.sources)
 
 
 def test_excerpt_leaves_short_text_untouched():
     text = "短文本，不需要标注"
     assert excerpt(text) == text
+
+
+def test_prompt_renderer_rejects_missing_and_unexpected_variables():
+    template = ChatPromptTemplate.from_messages([("system", "任务：{task}")])
+
+    with pytest.raises(ValueError, match="missing variables: task"):
+        render_prompt(template)
+    with pytest.raises(ValueError, match="unexpected variables: extra"):
+        render_prompt(template, task="调研", extra="不应传入")
+
+
+# The file name is the prompt name, so editing a template file cannot silently change
+# which variables a node must supply. A stray "{foo}" in prose fails here, not at render.
+_PROMPT_VARIABLES = {
+    "research_team.supervisor.instructions": set(),
+    "research_team.supervisor.status": {"status"},
+    "research_team.researcher.instructions": set(),
+    "research_team.researcher.task_brief": {
+        "intent",
+        "questions",
+        "subjects",
+        "constraints",
+        "known_urls",
+        "excerpt",
+    },
+    "research_team.researcher.judge_brief": {"questions", "constraints"},
+    "research_team.researcher.judge_results": {"listing"},
+    "research_team.analyst.instructions": set(),
+    "research_team.analyst.context": {"intent", "tasks", "subjects", "constraints", "sources"},
+    "research_team.writer.instructions": set(),
+    "research_team.writer.context": {
+        "intent",
+        "constraints",
+        "analysis",
+        "coverage",
+        "subject_coverage",
+        "evidence_statements",
+        "sources",
+    },
+}
+
+
+@pytest.mark.parametrize(("name", "expected"), sorted(_PROMPT_VARIABLES.items()))
+def test_prompt_file_declares_the_expected_variables(name: str, expected: set[str]) -> None:
+    template = ChatPromptTemplate.from_messages([("system", read_prompt(name))])
+    assert set(template.input_variables) == expected
+
+
+def test_read_prompt_fails_loudly_for_a_missing_file() -> None:
+    with pytest.raises(FileNotFoundError, match="missing"):
+        read_prompt("research_team.not_a_real_prompt")
+
+
+def test_every_prompt_file_is_non_empty() -> None:
+    files = sorted(PROMPTS_DIR.rglob("*.md"))
+    assert len(files) == len(_PROMPT_VARIABLES)
+    for path in files:
+        assert path.read_text(encoding="utf-8").strip(), f"{path} is empty"
+
+
+def test_clean_fetched_markdown_removes_page_noise_and_exact_duplicates():
+    content = """[首页](https://example.com/)
+[登录](javascript:void(0))
+    站点 > 新闻 > 正文
+    字体：小 中 大
+
+# 标题
+
+正文数字：2025 年产量为 100 万吨。
+| 指标 | 数值 |
+| --- | --- |
+| 产量 | 100 万吨 |
+正文数字：2025 年产量为 100 万吨。
+
+![站点 Logo](https://example.com/logo.png)
+[相关稿件](https://example.com/related)
+责任编辑：张三
+【纠错】 【责任编辑：李四】
+Copyright © 2000 - 2026 Example
+版权所有：Example
+"""
+
+    cleaned = clean_fetched_markdown(content)
+
+    assert "[首页]" not in cleaned
+    assert "javascript:" not in cleaned
+    assert "站点 > 新闻 > 正文" not in cleaned
+    assert "字体：" not in cleaned
+    assert "Logo" not in cleaned
+    assert "[相关稿件]" not in cleaned
+    assert "责任编辑" not in cleaned
+    assert "Copyright" not in cleaned
+    assert "版权所有" not in cleaned
+    assert cleaned.count("正文数字") == 1
+    assert "| 产量 | 100 万吨 |" in cleaned
+
+
+def test_clean_fetched_markdown_keeps_repeated_table_rows_across_tables():
+    content = """# 表一
+| 指标 | 数值 |
+| --- | --- |
+| 产量 | 100 |
+
+# 表二
+| 指标 | 数值 |
+| --- | --- |
+| 销量 | 200 |
+"""
+
+    cleaned = clean_fetched_markdown(content)
+
+    assert cleaned.count("| 指标 | 数值 |") == 2
+    assert cleaned.count("| --- | --- |") == 2
+    assert "| 销量 | 200 |" in cleaned
+
+
+def test_deep_read_cleans_before_content_limit():
+    source = Source(url="https://high.example/1", authority=3, rerank_score=2.0)
+    noisy_prefix = "[首页](https://example.com/)\n" * 100
+    useful = "核心数据。" * 1000
+
+    async def fake_fetch(url: str) -> dict[str, str]:
+        return {"title": "正文", "content": noisy_prefix + useful}
+
+    with patch("agents.research_team.researcher.fetch", side_effect=fake_fetch):
+        fetched = asyncio.run(_deep_read([source]))
+
+    assert fetched == 1
+    assert source.content.startswith("核心数据。")
+    assert len(source.content) == MAX_CONTENT_CHARS
 
 
 def test_excerpt_marks_truncation_with_total_length():
@@ -1742,6 +1879,49 @@ def test_requires_table_scopes_negation_to_the_table_clause():
     assert requires_table(["表格不用太多"]) is True
     # An explicit refusal wins over a positive request elsewhere.
     assert requires_table(["用表格", "不用表格"]) is False
+
+
+def _coverage_with_a_conflicting_aspect() -> list[SubjectEvidenceCoverage]:
+    return [
+        SubjectEvidenceCoverage(
+            subject_id="S1",
+            subject="示例市场",
+            aspects=[
+                AspectCoverage(
+                    name="产能",
+                    status="conflicting",
+                    evidence_strength="moderate",
+                    source_indices=[1, 2],
+                    gaps=["两家口径不一致"],
+                    reason="来源互相矛盾",
+                ),
+                AspectCoverage(
+                    name="价格",
+                    status="sufficient",
+                    evidence_strength="strong",
+                    source_indices=[1],
+                    gaps=[],
+                    reason="单一权威来源",
+                ),
+            ],
+            status="conflicting",
+            evidence_strength="moderate",
+            source_indices=[1, 2],
+            gaps=["两家口径不一致"],
+            reason="来源互相矛盾",
+        )
+    ]
+
+
+def test_subject_coverage_renders_a_conflicting_aspect_only_in_the_list_form():
+    # The table prints coverage and gaps in adjacent columns, so listing the conflicting
+    # aspect there would put it in both columns with opposite meanings.
+    coverage = _coverage_with_a_conflicting_aspect()
+
+    assert "产能" in _render_subject_coverage(coverage, include_table=False)
+
+    table = _render_subject_coverage(coverage, include_table=True)
+    assert "| 示例市场 | 价格 |" in table
 
 
 def test_table_required_schema_forbids_an_empty_list():
@@ -2068,7 +2248,6 @@ async def test_finalize_does_not_claim_the_round_cap_when_it_was_not_hit():
             "sources": [make_source("https://a.example/1")],
             "analysis": "## 事实基线\n- 已确证 [1]",
             "rounds": 2,
-            "max_rounds": 5,
         }
     )
     content = result["messages"][0].content

@@ -49,6 +49,9 @@ services:
         - path: src/agents/
           action: sync+restart
           target: /app/agents/
+        - path: prompts/
+          action: sync+restart
+          target: /prompts/
         - path: src/schema/
           action: sync+restart
           target: /app/schema/

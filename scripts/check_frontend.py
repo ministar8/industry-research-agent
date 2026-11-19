@@ -154,6 +154,21 @@ def main():
         page.locator("#question").fill("离线模拟调研")
         page.locator("#sendQuestion").click()
         expect(page.locator(".chat-answer")).to_have_count(1)
+        rest = page.locator(".chat-answer-rest").first
+        expect(rest).to_be_visible()
+        expect(page.locator(".chat-answer .markdown").first).to_contain_text("主要发现")
+        assert not rest.locator(".markdown").is_visible()
+        page.screenshot(path=OUT / "chat-collapsed.png")
+        rest.locator("summary").click()
+        expect(rest.locator(".markdown")).to_be_visible()
+        expect(rest.locator(".markdown")).to_contain_text("分析")
+        page.screenshot(path=OUT / "chat-expanded.png")
+        rest.locator("summary").click()
+        with page.expect_download() as event:
+            page.locator(".chat-answer > .button").first.click()
+        exported = Path(event.value.path()).read_text(encoding="utf-8")
+        assert "## 摘要" in exported and "## 分析" in exported and "## 结论" in exported
+        checks.append("chat answer collapsed by default, expandable, export keeps full report")
         page.locator("#question").fill("继续比较")
         page.locator("#question").press("Control+Enter")
         expect(page.locator(".chat-answer")).to_have_count(2)

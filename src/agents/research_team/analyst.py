@@ -15,54 +15,19 @@ from agents.research_team.contracts import (
     ResearchTask,
     SubjectEvidenceCoverage,
 )
-from agents.research_team.helpers import (
-    dedupe_sources,
-    numbered_sources,
-    resolve_model,
-    structured_output,
-)
+from agents.research_team.prompts import load_prompt, render_prompt
+from agents.research_team.sources import dedupe_sources, join_gaps, numbered_sources
 from agents.research_team.state import (
     ResearchState,
 )
-from core import settings
+from agents.research_team.structured import structured_output
+from core import resolve_model, settings
 from core.metrics import record_degradation
 
 logger = logging.getLogger(__name__)
 
-ANALYST_PROMPT = """你是行业与竞品调研团队的分析师。输入是检索员采集的原始来源，你负责把它转化为
-可信的、可被引用的结构化分析。你不撰写最终报告。
-
-工作方法：
-1. 去重：同一事实被多家转载时只保留一手或最权威的那条。
-2. 交叉验证：同一事实至少两个独立来源才算确证；只有一个来源时必须标注「单源未验证」。
-3. 识别矛盾：指出来源之间的冲突、统计口径差异、时间窗口不一致，不要掩盖。
-4. 识别缺口：明确哪些关键信息仍然缺失，以及缺失对结论的影响。
-5. 建立子问题覆盖：逐一判断每个 task 是否被现有来源充分覆盖，不得新增或遗漏 task。
-6. 建立对象覆盖：对每个给定研究对象，逐一判断关键证据维度，不得遗漏对象。
-7. 提炼模式：给出 2-5 条对决策有意义的判断，不要复述事实。
-8. 区分证据类型：把离散数据点、期间变化、趋势、规划/预测和状态分别记录到 evidence_statements。
-
-硬性要求：
-- 每条事实后必须标注来源编号，如 [1][4]。
-- coverage 中的 source_indices 必须使用来源列表中的 1-based 编号，不得编造编号。
-- coverage 必须为每个 task 输出一行；没有证据时使用 missing，而不是猜测结论。
-- subject_coverage 必须为每个研究对象输出一行；对象内部列出关键证据维度。
-- 对比对象必须尽量使用相同维度；一方是电池数据、另一方是整车数据时，标记口径不可直接比较。
-- sufficient 表示证据基本充分，partial 表示可以有限判断但仍有缺口，
-  conflicting 表示来源或统计口径存在影响结论的冲突。
-- evidence_strength 表示现有证据支持结论的强度：strong（直接且多源或权威一手来源）、
-  moderate（有依据但覆盖或交叉验证有限）、weak（间接或单源依据）、
-  insufficient（没有足够证据）。它不等同于来源本身的 authority 或 confidence。
-- 没有支持来源时必须使用 insufficient；conflicting 不得使用 strong。
-- 禁止引入来源之外的知识、常识或推测。
-- 数据必须保留原始口径（年份、地区、单位）。
-- evidence_statements 中，单个数据点使用 point；两个时期的可比变化使用 change。
-- 只有至少三个同口径时间点支持的系统判断才能使用 trend；来源明确写出趋势时使用
-  trend_origin=explicit_source_statement，不得把规划或预测写成实际趋势。
-- 每条 evidence_statement 必须带有效来源编号；无法确认时间、指标或单位时不要猜测。
-- 必须遵守给定的排除项：落在排除范围内的来源不纳入事实基线，并在信息缺口里说明被排除了什么。
-- 只把来源明确支持的内容标为 sufficient；仅提及对象不等于覆盖了该对象。
-- 直接给出结论，每项不超过两句话；不要展示推演过程。"""
+ANALYST_PROMPT = load_prompt("research_team.analyst.instructions")
+_ANALYST_CONTEXT_PROMPT = load_prompt("research_team.analyst.context")
 
 MAX_SOURCES_FOR_ANALYSIS = 12
 
@@ -367,7 +332,7 @@ def render_analysis(bundle: AnalysisBundle, coverage: list[EvidenceCoverage]) ->
     coverage_lines = []
     for item in coverage:
         sources = "".join(f"[{index}]" for index in item.source_indices) or "无"
-        gaps = "；".join(item.gaps) or "无"
+        gaps = join_gaps(item.gaps)
         coverage_lines.append(
             f"- [{item.task_id}] {item.question}：{item.status}；"
             f"证据强度 {item.evidence_strength}；来源 {sources}；"
@@ -378,7 +343,7 @@ def render_analysis(bundle: AnalysisBundle, coverage: list[EvidenceCoverage]) ->
         aspects = (
             "；".join(f"{aspect.name}:{aspect.status}" for aspect in item.aspects) or "未生成维度"
         )
-        gaps = "；".join(item.gaps) or "无"
+        gaps = join_gaps(item.gaps)
         subject_lines.append(
             f"- [{item.subject_id}] {item.subject}：{item.status}；"
             f"证据强度 {item.evidence_strength}；维度 {aspects}；"
@@ -428,21 +393,21 @@ async def analyst(state: ResearchState, config: RunnableConfig) -> dict[str, Any
     task_lines = (
         "\n".join(f"- [{task.id}] {task.question}" for task in tasks) or "（无已拆解子问题）"
     )
-    messages = [
-        SystemMessage(content=ANALYST_PROMPT),
-        SystemMessage(
-            content=f"调研意图：{state.get('intent') or '（未解析）'}\n\n"
-            f"本轮子问题（coverage 必须逐一对应，不得新增或遗漏）：\n{task_lines}\n\n"
-            f"本轮研究对象（subject_coverage 必须逐一对应，不得新增或遗漏）：\n"
-            + "\n".join(
-                f"- [{subject.id}] {subject.name}（别名：{'、'.join(subject.aliases) or '无'}）"
-                for subject in subjects
-            )
-            + "\n\n"
-            f"必须遵守的范围与交付约束：\n{constraints}\n\n"
-            f"来源列表：\n{numbered_sources(sources)}"
-        ),
-    ]
+    subject_lines = (
+        "\n".join(
+            f"- [{subject.id}] {subject.name}（别名：{'、'.join(subject.aliases) or '无'}）"
+            for subject in subjects
+        )
+        or "（无已识别研究对象）"
+    )
+    messages = render_prompt(ANALYST_PROMPT) + render_prompt(
+        _ANALYST_CONTEXT_PROMPT,
+        intent=state.get("intent") or "（未解析）",
+        tasks=task_lines,
+        subjects=subject_lines,
+        constraints=constraints,
+        sources=numbered_sources(sources),
+    )
     bundle: AnalysisBundle = await structured.ainvoke(messages)
     if len([item for item in bundle.facts if item.strip()]) < 2:
         # Schema already forbids an empty list; this catches a list of blank strings.

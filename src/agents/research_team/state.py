@@ -37,7 +37,6 @@ class ResearchState(MessagesState, total=False):
     report: str
     next_action: NextAction
     rounds: int
-    max_rounds: int
     active_turn_id: str
     active_context_mode: Literal["fresh", "reuse"]
     turn_attempted: bool

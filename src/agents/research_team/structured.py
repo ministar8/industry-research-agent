@@ -1,43 +1,23 @@
-"""Helpers shared by the research graph nodes."""
+"""Structured output binding with provider fallbacks.
+
+This layer talks to providers, not to the graph.
+Caps, retries and payload repair all depend on how an endpoint handles
+`response_format`, and none of it touches the research domain models.
+"""
 
 import json
 import logging
 import re
-from collections.abc import Sequence
 from typing import Any
-from urllib.parse import parse_qsl, urlencode, urlparse, urlunsplit
 
 from langchain_core.exceptions import OutputParserException
 from langchain_core.messages import AnyMessage, SystemMessage
-from langchain_core.runnables import RunnableConfig
 from openai import LengthFinishReasonError
 from pydantic import BaseModel, ValidationError
 
-from agents.research_team.contracts import Source
-from core import get_model, settings
-from core.llm import ModelT
 from core.metrics import record_degradation, record_usage
-from schema.models import AllModelEnum
-
-_LANG_SEGMENT = re.compile(r"/(?:zh-cn|zh-tw|cn|tw|hk|en|zh)(?=/|$)", re.IGNORECASE)
 
 logger = logging.getLogger(__name__)
-
-_AUTHORITY_BASE = {4: 0.90, 3: 0.80, 2: 0.65, 1: 0.50, 0: 0.40}
-
-# How much of a source the analyst and writer actually read. Fetch stores up to
-# MAX_CONTENT_CHARS, so a lower cap silently discards paid-for text *and* hides the
-# discard from the model, which then reads "absent" where the truth is "cut off".
-EXCERPT_CHARS = 1500
-
-
-def resolve_model(config: RunnableConfig | None = None) -> ModelT:
-    configured = config.get("configurable", {}).get("model") if config else None
-    model_name: AllModelEnum | None = configured or settings.DEFAULT_MODEL
-    if model_name is None:
-        raise ValueError("No default model configured")
-    return get_model(model_name)
-
 
 # Whether a provider accepts `response_format: json_schema`, keyed by model id.
 # Unknown providers are probed once; a 400 flips the entry to False for the process.
@@ -289,158 +269,3 @@ def _schema_hint(parameters: dict[str, Any]) -> SystemMessage:
             + json.dumps(parameters, ensure_ascii=False)
         )
     )
-
-
-def url_key(url: str) -> str:
-    """Normalise a URL so language and mobile variants of the same article collapse.
-
-    DeepSeek Search happily returns /cn/ and /tw/ copies of the same page, plus
-    m./www. host variants; those differ only by URL, so a naive URL comparison
-    lets one article in twice and makes a single source look like two independent
-    ones during cross-validation. The identity-bearing query is kept (via
-    clean_url) so two different articles that share a path but differ by ?id=
-    stay distinct.
-    """
-    parsed = urlparse(clean_url(url))
-    host = parsed.netloc.lower().removeprefix("www.").removeprefix("m.")
-    path = _LANG_SEGMENT.sub("", parsed.path.rstrip("/"))
-    key = f"{host}{path}"
-    return f"{key}?{parsed.query}" if parsed.query else key
-
-
-def confidence_from_authority(authority: int, rerank_score: float) -> float:
-    base = _AUTHORITY_BASE.get(authority, 0.45)
-    if rerank_score >= 2.5:
-        base += 0.10
-    elif rerank_score >= 1.5:
-        base += 0.05
-    return round(min(base, 1.0), 2)
-
-
-# Params that mark a share/channel, not the article itself. Dropping them lets the
-# same article shared via different channels collapse; identity params (?id=) stay.
-_TRACKING_PARAMS = frozenset(
-    {
-        "spm",
-        "from",
-        "ref",
-        "referrer",
-        "fbclid",
-        "gclid",
-        "scm",
-        "share_token",
-        "share_source",
-        "vd_source",
-    }
-)
-
-
-def clean_url(url: str) -> str:
-    """Drop fragments and tracking params; keep identity-bearing query, sorted.
-
-    Search appends anchors like `#1` and share tags like `?utm_source=`; those do
-    not identify the article. But some sites put the article id in the query
-    (`?id=1001`), so clearing the whole query would merge two different articles
-    and fetch the wrong page. Sorting makes parameter order irrelevant.
-    """
-    parsed = urlparse(url.strip())
-    pairs = [
-        (key, value)
-        for key, value in parse_qsl(parsed.query, keep_blank_values=True)
-        if key.lower() not in _TRACKING_PARAMS and not key.lower().startswith("utm_")
-    ]
-    query = urlencode(sorted(pairs))
-    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, query, ""))
-
-
-def clean_title(title: str) -> str:
-    """Collapse `Headline - Headline` titles that some news sites return."""
-    head, separator, tail = title.strip().partition(" - ")
-    if separator and head and tail.strip().startswith(head[:15]):
-        return head.strip()
-    return title.strip()
-
-
-def dedupe_sources(sources: Sequence[Source] | None) -> list[Source]:
-    """Keep the first occurrence of each page, preserving collection order.
-
-    A later round may deep-read a URL the first round only skimmed, appending a
-    second copy that carries the fetched body. First-wins alone would discard that
-    paid-for content, so the kept copy is upgraded with the deeper material instead
-    of mutated in place (state holds the originals).
-    """
-    seen: dict[str, Source] = {}
-    order: list[str] = []
-    for source in sources or []:
-        key = url_key(source.url)
-        if not key:
-            continue
-        kept = seen.get(key)
-        if kept is None:
-            seen[key] = source
-            order.append(key)
-            continue
-        update: dict[str, str] = {}
-        if len(source.content) > len(kept.content):
-            update["content"] = source.content
-        if len(source.summary) > len(kept.summary):
-            update["summary"] = source.summary
-        if update:
-            seen[key] = kept.model_copy(update=update)
-    return [seen[key] for key in order]
-
-
-def excerpt(text: str, limit: int = EXCERPT_CHARS) -> str:
-    """Cut an excerpt and say so.
-
-    A silent cut teaches the model that whatever it cannot see does not exist,
-    which corrupts the "information gap" section it is asked to write. The marker
-    is therefore part of the contract, not decoration.
-    """
-    text = (text or "").strip()
-    if len(text) <= limit:
-        return text
-    return f"{text[:limit]}…（节选，全文共 {len(text)} 字，此处为前 {limit} 字）"
-
-
-def numbered_sources(sources: Sequence[Source], include_excerpt: bool = True) -> str:
-    blocks = []
-    for index, source in enumerate(sources, start=1):
-        lines = [
-            f"[{index}] {source.title or source.url}",
-            f"    URL: {source.url}",
-            f"    站点: {source.site_name or '未知'} | 发布: {source.published_at or '未知'}",
-            f"    来源评分: {source.confidence:.2f}"
-            f"（authority {source.authority}, rerank {source.rerank_score:.2f}）",
-        ]
-        # Skipping the line entirely, rather than printing a placeholder, keeps 12
-        # sources from spending tokens on "excerpt omitted" twelve times.
-        if include_excerpt:
-            body = excerpt(source.content or source.summary or source.snippet)
-            lines.append(f"    摘录: {body}")
-        blocks.append("\n".join(lines))
-    return "\n".join(blocks)
-
-
-def source_appendix(sources: Sequence[Source]) -> str:
-    if not sources:
-        return ""
-    lines = ["", "---", "", "### 参考来源", ""]
-    for index, source in enumerate(sources, start=1):
-        title = source.title or source.url
-        published = f"，{source.published_at[:10]}" if source.published_at else ""
-        lines.append(
-            f"[{index}] [{title}]({source.url}) — 来源评分 {source.confidence:.2f}"
-            f"（{source.site_name or '未知来源'}{published}）"
-        )
-    return "\n".join(lines)
-
-
-def clamp_anchors(text: str, source_count: int) -> str:
-    """Drop citation anchors that do not resolve to a recorded source."""
-
-    def replace(match: re.Match[str]) -> str:
-        index = int(match.group(1))
-        return match.group(0) if 1 <= index <= source_count else ""
-
-    return re.sub(r"\[(\d+)\]", replace, text)

@@ -20,6 +20,7 @@ COPY --chown=app:app src/schema/ ./schema/
 COPY --chown=app:app src/service/ ./service/
 COPY --chown=app:app src/run_service.py .
 COPY --chown=app:app static/ /static/
+COPY --chown=app:app prompts/ /prompts/
 
 USER app
 CMD ["python", "run_service.py"]

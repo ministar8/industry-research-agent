@@ -5,7 +5,7 @@ It deliberately owns no tools. Everything it does is a decision over state.
 
 from typing import Any, Literal
 
-from langchain_core.messages import AIMessage, AnyMessage, SystemMessage
+from langchain_core.messages import AIMessage, AnyMessage
 from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, Field, model_validator
 
@@ -13,17 +13,14 @@ from agents.research_team.contracts import (
     ResearchSubject,
     ResearchTask,
 )
-from agents.research_team.helpers import (
-    dedupe_sources,
-    resolve_model,
-    source_appendix,
-    structured_output,
-)
+from agents.research_team.prompts import load_prompt, render_prompt
+from agents.research_team.sources import dedupe_sources, source_appendix
 from agents.research_team.state import (
     NextAction,
     ResearchState,
 )
-from core import settings
+from agents.research_team.structured import structured_output
+from core import resolve_model, settings
 from core.metrics import record_degradation
 
 MAX_ROUNDS = 5
@@ -32,45 +29,11 @@ MAX_ROUNDS = 5
 # runaway generation die cheap instead of burning the full shared LLM_MAX_TOKENS.
 ROUTING_MAX_TOKENS = 2048
 
-SUPERVISOR_PROMPT = """你是行业与竞品调研团队的调度中枢。你不搜索、不写作、不做分析，只做四件事：
-
-1. 意图解析：从用户的输入中提取真正要调研什么。
-2. 任务拆解：把调研目标拆成可独立回答的子问题。
-3. 路由调度：决定下一步交给哪个子智能体。
-4. 结果整合：调研完成后由系统把产出组装为最终答复（你只需选择 finalize）。
-
-用户通常不会只发一句话，而是发一整段自然描述，其中既有调研需求，也夹杂大量无关内容。
-你必须同时做两件事：
-
-【剥离】以下内容不进入任务，也不得影响子问题的措辞：
-- 寒暄、致谢、语气词、对上一轮结果的评价
-- 个人背景与动机（「我在做投资」「我是做供应链的」），除非它限定了调研范围
-- 与调研对象无关的闲谈、情绪表达、重复啰嗦的铺垫
-
-【保真】以下内容必须原样保留，不得概括掉：
-- 调研对象：行业、公司、产品、技术路线、产业链环节
-- 范围限定：时间区间、地区、统计口径
-- 明确的排除项（「不看上游」「排除代工厂」）
-- 交付要求：格式（表格 / 清单 / 叙述）、篇幅、面向对象、语言
-
-保真项写入 constraints；没有则给空列表。
-
-可路由的目标：
-- researcher：缺少外部信息，或现有来源不足以支撑结论。
-- analyst：来源已足够，但还没有形成结构化分析。
-- writer：分析已完成，需要产出成稿报告。
-- finalize：报告已完成且本轮没有新要求。选择 finalize 时系统返回既有成果，不新生成内容。
-
-硬性规则：
-- 来源为空时不得选择 analyst。
-- 分析为空时不得选择 writer。
-- 子问题必须具体到可直接检索，且必须锚定用户提到的调研对象。
-  正面：「2025 年中国换电重卡销量与主要运营商份额」；反面：「了解一下换电」。
-- 研究对象必须单独列出，覆盖用户提到的全部主要对象，并为每个对象提供稳定 ID 和别名。
-- 子问题数量 1-4 个，需覆盖用户提到的全部主要对象，不要遗漏后文才提到的对象。
-- 对比问题必须保留一个同时涉及双方的比较子问题，不能只生成单方任务。
-- 哪怕整段输入只有一句与调研相关，也要抓住它继续调研，不要因为夹杂无关内容就选择 finalize。
-- 只有当整段输入确实找不到任何可调研对象时，才选择 finalize。"""
+SUPERVISOR_PROMPT = load_prompt(
+    "research_team.supervisor",
+    "research_team.supervisor.instructions",
+    "research_team.supervisor.status",
+)
 
 
 class RoutingDecision(BaseModel):
@@ -134,7 +97,7 @@ def _status_block(state: ResearchState) -> str:
 - 子问题证据覆盖：{coverage_summary}
 - 对象证据覆盖：{len(subject_coverage)} 条
 - 报告完成：{"是" if state.get("report") else "否"}
-- 已用调度轮次：{state.get("rounds") or 0}/{state.get("max_rounds") or MAX_ROUNDS}"""
+- 已用调度轮次：{state.get("rounds") or 0}/{MAX_ROUNDS}"""
 
 
 def _enforce(decision: RoutingDecision, state: ResearchState) -> NextAction:
@@ -253,7 +216,6 @@ async def supervisor(state: ResearchState, config: RunnableConfig) -> dict[str, 
         return {"next_action": "finalize"}
 
     rounds = (turn_state.get("rounds") or 0) + 1
-    max_rounds = turn_state.get("max_rounds") or MAX_ROUNDS
     # rounds is scoped to the active turn; the last message being human is only the
     # compatibility fallback when a caller does not provide a turn_id.
 
@@ -264,13 +226,13 @@ async def supervisor(state: ResearchState, config: RunnableConfig) -> dict[str, 
         decider = structured_output(
             model, RoutingDecision, "supervisor", max_tokens=ROUTING_MAX_TOKENS
         )
-        messages: list[AnyMessage] = [
-            SystemMessage(content=SUPERVISOR_PROMPT + "\n\n" + _status_block(turn_state))
-        ]
+        messages: list[AnyMessage] = render_prompt(
+            SUPERVISOR_PROMPT, status=_status_block(turn_state)
+        )
         messages.extend(state["messages"][-12:])
         decision = await decider.ainvoke(messages)
 
-    target = "finalize" if rounds > max_rounds else _enforce(decision, turn_state)
+    target = "finalize" if rounds > MAX_ROUNDS else _enforce(decision, turn_state)
 
     update: dict[str, Any] = {
         "intent": decision.intent,
@@ -349,8 +311,7 @@ def route(state: ResearchState) -> Literal["researcher", "analyst", "writer", "f
     if state.get("abort_reason"):
         return "finalize"
     rounds = state.get("rounds") or 0
-    max_rounds = state.get("max_rounds") or MAX_ROUNDS
-    if rounds > max_rounds:
+    if rounds > MAX_ROUNDS:
         return "finalize"
     return state.get("next_action") or "finalize"
 
@@ -385,7 +346,7 @@ async def finalize(state: ResearchState) -> dict[str, Any]:
     elif analysis:
         # Only claim the round cap when it actually fired; otherwise the note misleads
         # whoever reads the output into thinking the graph ran out of budget.
-        capped = rounds > (state.get("max_rounds") or MAX_ROUNDS)
+        capped = rounds > MAX_ROUNDS
         note = (
             "\n\n> 本轮达到调度上限，已返回阶段性分析。"
             if capped
