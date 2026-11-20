@@ -32,11 +32,16 @@ _strict_blocked_until: dict[str, float] = {}
 
 
 def _strict_allowed(key: str) -> bool:
+    """An empty key means "unidentified endpoint": always probe, never cache."""
+    if not key:
+        return True
     deadline = _strict_blocked_until.get(key)
     return deadline is None or time.monotonic() >= deadline
 
 
 def _mark_strict_unsupported(key: str) -> None:
+    if not key:
+        return
     _strict_blocked_until[key] = time.monotonic() + STRICT_RETRY_AFTER_SECONDS
 
 
@@ -79,11 +84,11 @@ class _StructuredOutput:
         self._label = label or "-"
         self._max_tokens = max_tokens
         # Capability belongs to the endpoint, not the model name: the same id can be
-        # served by a provider that rejects json_schema.
-        self._key = (
-            f"{getattr(model, 'model_name', '') or id(model)}"
-            f"@{getattr(model, 'openai_api_base', '') or ''}"
-        )
+        # served by a provider that rejects json_schema. An object without a name has
+        # no stable identity - `id()` is recycled once it is collected, which would let
+        # one endpoint's verdict land on another - so it is simply not cached.
+        name = getattr(model, "model_name", "") or ""
+        self._key = f"{name}@{getattr(model, 'openai_api_base', '') or ''}" if name else ""
         self._api_schema = inline_schema(schema.model_json_schema())
         self._hint = _schema_hint(self._api_schema)
         self._strict: Any = None

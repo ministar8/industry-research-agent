@@ -3280,3 +3280,20 @@ def test_constraints_merge_within_a_turn_and_reset_across_turns():
     ]
     # A new request must not inherit the previous one's scope.
     assert _constraints_for(["排除：乘用车"], decision, True) == ["地区：中国", "时间：2024"]
+
+
+def test_unnamed_endpoints_are_never_cached():
+    from agents.research_team import structured as module
+
+    class _Stub:
+        pass
+
+    out = module.structured_output(_Stub(), RoutingDecision)
+    # No model_name means no stable identity: `id()` is recycled after collection, so
+    # one endpoint's verdict could land on another (this is what broke the OOM test
+    # under Python 3.14).
+    assert out._key == ""
+
+    module._mark_strict_unsupported(out._key)
+    assert module._strict_allowed(out._key) is True
+    assert "" not in module._strict_blocked_until
