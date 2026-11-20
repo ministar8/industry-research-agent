@@ -70,6 +70,24 @@ function addProcess(messages) {
   $('chatMessages').append(node);
 }
 
+/* 运行中的过程块：节点每完成一步就推送一条消息，边收边显示比攒到最后更能说明进展。
+   结束后折叠成过程记录，最后一条消息交出作为正式答案。 */
+function createProcessBlock() {
+  const node = document.createElement('details'); node.className = 'chat-process'; node.open = true;
+  node.innerHTML = '<summary></summary><div class="process-body"></div>';
+  $('chatMessages').append(node);
+  const summary = node.querySelector('summary'); const body = node.querySelector('.process-body');
+  const render = () => { summary.textContent = `查看服务过程消息 · ${body.children.length} 条`; };
+  render();
+  return {
+    node,
+    count: () => body.children.length,
+    add(text) { const p = document.createElement('p'); p.textContent = text; body.append(p); render(); },
+    takeLast() { const last = body.lastElementChild; const text = last ? last.textContent : ''; last?.remove(); render(); return text; },
+    finish() { node.open = false; },
+  };
+}
+
 /* ── 会话 ── */
 export function newThread() {
   if (isBusy()) { notify('请先停止等待，再新建调研。'); return false; }
@@ -117,17 +135,25 @@ async function sendQuestion(event, navigate) {
   busy(true); navigate('chat'); addQuestion(message); $('question').value = '';
   const status = document.createElement('p'); status.className = 'chat-status'; status.setAttribute('role', 'status');
   $('chatMessages').append(status); const start = Date.now(); const messages = [];
+  let process = null;
+  const appendProcess = (text) => { process ||= createProcessBlock(); process.add(text); };
   const update = () => { status.textContent = `调研进行中 · 已等待 ${Math.floor((Date.now() - start) / 1000)} 秒${messages.length ? ` · 收到 ${messages.length} 条服务消息` : ''}`; };
   update(); const timer = setInterval(update, 1000);
   try {
-    for await (const text of streamResearch({ message, thread_id: state.threadId, user_id: state.userId }, state.controller.signal)) { if (text.trim()) messages.push(text); update(); }
+    for await (const text of streamResearch({ message, thread_id: state.threadId, user_id: state.userId }, state.controller.signal)) {
+      if (!text.trim()) continue;
+      messages.push(text); appendProcess(text); update();
+    }
     if (!messages.length) throw new Error('服务已结束，但未返回研究结果。');
-    status.remove(); addProcess(messages.slice(0, -1)); addAnswer(messages.at(-1));
+    status.remove();
+    const answer = process ? process.takeLast() : messages.at(-1);
+    if (process) { process.finish(); if (!process.count()) process.node.remove(); }
+    addAnswer(answer);
     notify('调研结果已返回，可查看来源或导出报告。');
   } catch (error) {
     status.classList.add('error');
     status.textContent = error.name === 'AbortError' ? '已停止等待。后端可能仍在运行或计费，可稍后从会话记录查看结果。' : error.message || '网络连接失败，未自动重试。';
-    if (messages.length) addProcess(messages);
+    if (process) process.finish(); else if (messages.length) addProcess(messages);
     $('question').value = message;
   } finally { clearInterval(timer); state.controller = null; busy(false); refreshHistory(); }
 }
