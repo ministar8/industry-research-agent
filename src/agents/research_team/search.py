@@ -58,13 +58,57 @@ def is_fetchable(url: str) -> bool:
     return parsed.scheme in {"http", "https"} and bool(parsed.hostname) and "@" not in parsed.netloc
 
 
+_client: httpx.AsyncClient | None = None
+_client_loop: asyncio.AbstractEventLoop | None = None
+
+
+async def _close_quietly(client: httpx.AsyncClient) -> None:
+    """Close a pool without letting a dead loop turn cleanup into a failure."""
+    if client.is_closed:
+        return
+    try:
+        await client.aclose()
+    except Exception:
+        # A loop that is gone cannot clean up after itself; dropping the pool silently
+        # is still better than failing the request that triggered the switch.
+        logger.debug("Closing an HTTP client failed", exc_info=True)
+
+
+async def _shared_client(timeout: float) -> httpx.AsyncClient:
+    """Reuse one connection pool per event loop.
+
+    A round issues four searches plus a handful of fetches; a fresh client per call
+    pays a TLS handshake every time. The pool belongs to the loop that created it, so a
+    different loop gets a fresh client - and the stale one is closed rather than
+    dropped, otherwise every loop switch leaks its sockets.
+    """
+    global _client, _client_loop
+    loop = asyncio.get_running_loop()
+    if _client is not None and _client_loop is not loop:
+        await _close_quietly(_client)
+        _client = None
+    if _client is None or _client.is_closed:
+        _client = httpx.AsyncClient(timeout=timeout)
+        _client_loop = loop
+    return _client
+
+
+async def close_shared_client() -> None:
+    """Release the pool on shutdown; nothing else closes it before the process exits."""
+    global _client
+    client, _client = _client, None
+    if client is not None:
+        await _close_quietly(client)
+
+
 async def _post(path: str, payload: dict[str, Any], timeout: float) -> dict[str, Any]:
     headers = _headers()
     last_error = "unknown"
     for attempt in range(MAX_ATTEMPTS):
         try:
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                response = await client.post(f"{BASE_URL}/{path}", headers=headers, json=payload)
+            response = await (await _shared_client(timeout)).post(
+                f"{BASE_URL}/{path}", headers=headers, json=payload, timeout=timeout
+            )
         except httpx.HTTPError as exc:
             last_error = f"{type(exc).__name__}: {exc}"
         else:

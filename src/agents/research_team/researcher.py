@@ -6,13 +6,19 @@ import math
 from collections.abc import Mapping
 from typing import Any
 
-from langchain_core.messages import AIMessage, SystemMessage
+from langchain_core.messages import AIMessage, AnyMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, Field
 
-from agents.research_team.contracts import Source
+from agents.research_team.contracts import AUTHORITY_UNKNOWN, Source
 from agents.research_team.prompts import load_prompt, render_prompt
-from agents.research_team.search import SearchRejected, fetch, is_fetchable, search
+from agents.research_team.search import (
+    MAX_QUERY_CHARS,
+    SearchRejected,
+    fetch,
+    is_fetchable,
+    search,
+)
 from agents.research_team.sources import (
     clean_fetched_markdown,
     clean_title,
@@ -24,7 +30,7 @@ from agents.research_team.sources import (
 from agents.research_team.state import ResearchState
 from agents.research_team.structured import structured_output
 from core import resolve_model, settings
-from core.metrics import record_degradation, record_fetch, record_filter, record_search
+from core.metrics import Degradation, record_degradation, record_fetch, record_filter, record_search
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +42,6 @@ MIN_AUTHORITY_FOR_FETCH = 3
 MIN_RERANK_FOR_FETCH = 1.5
 MAX_CONTENT_CHARS = 4000
 MAX_RAW_EXCERPT = 400
-MAX_QUERY_CHARS = 128
 FALLBACK_MIN_AUTHORITY = 2
 FALLBACK_MIN_RERANK = 1.5
 
@@ -66,6 +71,11 @@ class SourceJudgement(BaseModel):
 
 class SourceJudgements(BaseModel):
     sources: list[SourceJudgement]
+
+
+def _researcher_system() -> list[AnyMessage]:
+    """The role prompt, with the query limit taken from the adapter that enforces it."""
+    return render_prompt(RESEARCHER_PROMPT, max_query_chars=str(MAX_QUERY_CHARS))
 
 
 def _task_brief(state: ResearchState) -> str:
@@ -132,17 +142,17 @@ async def _plan_queries(state: ResearchState, config: RunnableConfig) -> list[st
     try:
         model: Any = resolve_model(config)
         planner = structured_output(model, QueryPlan, "planner", max_tokens=QUERY_PLAN_MAX_TOKENS)
-        messages = render_prompt(RESEARCHER_PROMPT) + [SystemMessage(content=_task_brief(state))]
+        messages = _researcher_system() + [SystemMessage(content=_task_brief(state))]
         plan: QueryPlan = await planner.ainvoke(messages)
     except Exception as exc:
         logger.warning("Query planning failed, using task text instead: %s", exc)
-        record_degradation("query_planning_failed")
+        record_degradation(Degradation.QUERY_PLANNING_FAILED)
         return _fallback_queries(state)
 
     queries = [q.strip() for q in plan.queries if q.strip()][:MAX_QUERIES]
     if not queries:
         logger.warning("Query planning returned no usable query, using task text instead")
-        record_degradation("query_planning_empty")
+        record_degradation(Degradation.QUERY_PLANNING_EMPTY)
         return _fallback_queries(state)
     return queries
 
@@ -167,14 +177,14 @@ async def _judge(
         model: Any = resolve_model(config)
         judge = structured_output(model, SourceJudgements, "judge", max_tokens=JUDGE_MAX_TOKENS)
         messages = (
-            render_prompt(RESEARCHER_PROMPT)
+            _researcher_system()
             + [SystemMessage(content=_judge_brief(state))]
             + render_prompt(_JUDGE_RESULTS_PROMPT, listing=listing)
         )
         return await judge.ainvoke(messages)
     except Exception as exc:
         logger.warning("Relevance judgement failed, falling back to score thresholds: %s", exc)
-        record_degradation("judge_fallback")
+        record_degradation(Degradation.JUDGE_FALLBACK)
         return SourceJudgements(
             sources=[
                 SourceJudgement(url=candidate["url"], keep=True)
@@ -195,7 +205,7 @@ def _safe_score(item: Mapping[str, Any], field: str, default: int | float) -> in
         if not math.isfinite(number):
             raise ValueError
         if field == "authority":
-            if not number.is_integer() or not -1 <= number <= 4:
+            if not number.is_integer() or not AUTHORITY_UNKNOWN <= number <= 4:
                 raise ValueError
             return int(number)
         if not 0 <= number <= 3:
@@ -203,14 +213,14 @@ def _safe_score(item: Mapping[str, Any], field: str, default: int | float) -> in
         return number
     except (TypeError, ValueError):
         logger.warning("Ignoring invalid Search %s field of type %s", field, type(value).__name__)
-        record_degradation("search_result_invalid_field")
+        record_degradation(Degradation.SEARCH_RESULT_INVALID_FIELD)
         return default
 
 
 def _candidate(item: Any, query: str) -> dict[str, Any] | None:
     if not isinstance(item, Mapping):
         logger.warning("Skipping Search result with type %s", type(item).__name__)
-        record_degradation("search_result_invalid_item")
+        record_degradation(Degradation.SEARCH_RESULT_INVALID_ITEM)
         return None
     return {
         "url": clean_url(str(item.get("url") or "")),
@@ -219,7 +229,7 @@ def _candidate(item: Any, query: str) -> dict[str, Any] | None:
         "summary": str(item.get("summary") or ""),
         "site_name": str(item.get("site_name") or ""),
         "published_at": str(item.get("date") or ""),
-        "authority": _safe_score(item, "authority", -1),
+        "authority": _safe_score(item, "authority", AUTHORITY_UNKNOWN),
         "rerank_score": _safe_score(item, "rerank_score", 0.0),
         "query": query,
     }
@@ -328,20 +338,17 @@ async def _deep_read(sources: list[Source]) -> int:
     return fetched
 
 
-async def researcher(state: ResearchState, config: RunnableConfig) -> dict[str, Any]:
-    if settings.USE_FAKE_MODEL:
-        return {"turn_attempted": True, "messages": [AIMessage(content="（假模型模式）跳过检索。")]}
+def _collect_batches(
+    queries: list[str], batches: list[Any]
+) -> tuple[list[tuple[str, list[Any]]], int, int]:
+    """Split gathered results into usable batches plus failure and rejection counts.
 
-    queries = await _plan_queries(state, config)
-    intent = state.get("intent") or None
-    batches = await asyncio.gather(
-        *(search(query, RESULTS_PER_QUERY, ori_question=intent) for query in queries),
-        return_exceptions=True,
-    )
-
+    Cancellation and non-Exception `BaseException`s are re-raised: those are not
+    "search returned nothing", and swallowing them would report an empty round.
+    """
+    usable: list[tuple[str, list[Any]]] = []
     failures = 0
     rejected = 0
-    batches_for_filter: list[tuple[str, list[Any]]] = []
     for query, batch in zip(queries, batches, strict=True):
         if isinstance(batch, BaseException):
             if isinstance(batch, asyncio.CancelledError):
@@ -354,8 +361,40 @@ async def researcher(state: ResearchState, config: RunnableConfig) -> dict[str, 
                 record_search(ok=False)
                 continue
             raise batch
-        batches_for_filter.append((query, batch))
+        usable.append((query, batch))
+    return usable, failures, rejected
 
+
+def _empty_run_reason(raw_count: int, failures: int, filter_counts: dict[str, int]) -> str:
+    """Explain an empty candidate set from what the API and the filters reported."""
+    if raw_count == 0 and failures:
+        return "未返回结果"
+    if raw_count == 0:
+        return "空结果"
+    discarded = (
+        filter_counts["invalid_item"]
+        + filter_counts["invalid_url"]
+        + filter_counts["empty_content"]
+    )
+    if discarded == raw_count:
+        return "全无效"
+    if filter_counts["duplicate"] == raw_count:
+        return "全重复"
+    return "过滤后无可用结果"
+
+
+async def researcher(state: ResearchState, config: RunnableConfig) -> dict[str, Any]:
+    if settings.USE_FAKE_MODEL:
+        return {"turn_attempted": True, "messages": [AIMessage(content="（假模型模式）跳过检索。")]}
+
+    queries = await _plan_queries(state, config)
+    intent = state.get("intent") or None
+    batches = await asyncio.gather(
+        *(search(query, RESULTS_PER_QUERY, ori_question=intent) for query in queries),
+        return_exceptions=True,
+    )
+
+    batches_for_filter, failures, rejected = _collect_batches(queries, batches)
     raw_count = sum(len(batch) for _, batch in batches_for_filter)
     candidates, filter_counts = _filter_candidates(batches_for_filter, state.get("sources") or [])
     for reason, count in filter_counts.items():
@@ -363,21 +402,7 @@ async def researcher(state: ResearchState, config: RunnableConfig) -> dict[str, 
     filter_note = _filter_note(filter_counts, raw_count, len(candidates))
 
     if not candidates:
-        if raw_count == 0 and failures:
-            outcome = "未返回结果"
-        elif raw_count == 0:
-            outcome = "空结果"
-        elif (
-            filter_counts["invalid_item"]
-            + filter_counts["invalid_url"]
-            + filter_counts["empty_content"]
-            == raw_count
-        ):
-            outcome = "全无效"
-        elif filter_counts["duplicate"] == raw_count:
-            outcome = "全重复"
-        else:
-            outcome = "过滤后无可用结果"
+        outcome = _empty_run_reason(raw_count, failures, filter_counts)
         detail = f"（{failures} 条查询调用失败）" if failures else ""
         update: dict[str, Any] = {
             "turn_attempted": True,
@@ -385,7 +410,7 @@ async def researcher(state: ResearchState, config: RunnableConfig) -> dict[str, 
         }
         if rejected and rejected == len(queries):
             # Every query was refused, so the next round would fail identically.
-            record_degradation("search_rejected")
+            record_degradation(Degradation.SEARCH_REJECTED)
             update["abort_reason"] = "search_rejected"
         return update
 

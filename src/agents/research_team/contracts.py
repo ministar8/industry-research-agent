@@ -4,6 +4,11 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+# Search does not always report an authority level. The sentinel lives outside the
+# 0-4 scale on purpose: a value inside it would be indistinguishable from a real score
+# and would silently rank as authoritative.
+AUTHORITY_UNKNOWN = -1
+
 
 class ResearchTask(BaseModel):
     id: str = Field(description="Stable identifier, e.g. T1")
@@ -25,7 +30,7 @@ class EvidenceCoverage(BaseModel):
     task_id: str = Field(description="对应 ResearchTask 的稳定 ID，例如 T1")
     question: str = Field(description="对应 ResearchTask 的原始问题")
     source_indices: list[int] = Field(
-        description="支持该子问题的来源编号，使用分析输入中的 1-based 编号"
+        description="支持该子问题的来源编号，使用本轮来源账本的 1-based 序号，不是批次内编号"
     )
     status: Literal["sufficient", "partial", "missing", "conflicting"] = Field(
         description="该子问题的证据覆盖状态"
@@ -45,7 +50,9 @@ class AspectCoverage(BaseModel):
     evidence_strength: Literal["strong", "moderate", "weak", "insufficient"] = Field(
         description="该证据维度的证据强度"
     )
-    source_indices: list[int] = Field(description="支持该维度的来源编号，使用 1-based 编号")
+    source_indices: list[int] = Field(
+        description="支持该维度的来源编号，使用本轮来源账本的 1-based 序号"
+    )
     gaps: list[str] = Field(description="该维度的信息缺口，没有则为空")
     reason: str = Field(description="该维度判断的简短理由")
 
@@ -60,7 +67,9 @@ class SubjectEvidenceCoverage(BaseModel):
     evidence_strength: Literal["strong", "moderate", "weak", "insufficient"] = Field(
         description="该对象总体证据强度"
     )
-    source_indices: list[int] = Field(description="支持该对象的来源编号，使用 1-based 编号")
+    source_indices: list[int] = Field(
+        description="支持该对象的来源编号，使用本轮来源账本的 1-based 序号"
+    )
     gaps: list[str] = Field(description="该对象仍缺失的信息，没有则为空")
     reason: str = Field(description="该对象总体判断的简短理由")
 
@@ -77,7 +86,9 @@ class EvidenceStatement(BaseModel):
     )
     metric: str | None = Field(default=None, description="指标名称")
     unit: str | None = Field(default=None, description="指标单位")
-    source_indices: list[int] = Field(description="支持该陈述的来源编号，使用 1-based 编号")
+    source_indices: list[int] = Field(
+        description="支持该陈述的来源编号，使用本轮来源账本的 1-based 序号"
+    )
     trend_origin: Literal["computed", "explicit_source_statement", "unknown"] = Field(
         default="unknown", description="趋势来自数据点计算还是来源明确表述"
     )
@@ -91,7 +102,12 @@ class Source(BaseModel):
     content: str = Field(default="", description="Fetch 抓取的正文 Markdown")
     site_name: str = ""
     published_at: str = ""
-    authority: int = Field(default=-1, ge=-1, le=4, description="-1 未知，3 以上为高权威")
+    authority: int = Field(
+        default=AUTHORITY_UNKNOWN,
+        ge=AUTHORITY_UNKNOWN,
+        le=4,
+        description="信息来源权威度：-1 表示未知，3 以上为高权威",
+    )
     rerank_score: float = Field(default=0.0, description="0-3，1.5 以上为高质量")
     query: str = Field(default="", description="The query that surfaced this source")
     confidence: float = Field(
@@ -100,6 +116,7 @@ class Source(BaseModel):
 
 
 __all__ = [
+    "AUTHORITY_UNKNOWN",
     "AspectCoverage",
     "EvidenceCoverage",
     "EvidenceStatement",

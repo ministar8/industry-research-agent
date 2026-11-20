@@ -23,6 +23,9 @@ _MODEL_TABLE = (
     | {m: m.value for m in FakeModelName}
 )
 
+# DashScope rejects these models unless thinking is on, regardless of the global toggle.
+_THINKING_REQUIRED = frozenset({DashScopeModelName.GLM_53})
+
 
 class FakeToolModel(FakeListChatModel):
     def __init__(self, responses: list[str]):
@@ -61,8 +64,9 @@ def get_model(model_name: AllModelEnum, /) -> ModelT:
     if model_name in DashScopeModelName:
         if not settings.DASHSCOPE_API_KEY:
             raise ValueError("DASHSCOPE_API_KEY must be configured")
-        extra_body: dict[str, Any] = {"enable_thinking": settings.DASHSCOPE_ENABLE_THINKING}
-        if settings.DASHSCOPE_ENABLE_THINKING and settings.DASHSCOPE_THINKING_BUDGET:
+        enable_thinking = settings.DASHSCOPE_ENABLE_THINKING or model_name in _THINKING_REQUIRED
+        extra_body: dict[str, Any] = {"enable_thinking": enable_thinking}
+        if enable_thinking and settings.DASHSCOPE_THINKING_BUDGET:
             extra_body["thinking_budget"] = settings.DASHSCOPE_THINKING_BUDGET
         return ChatOpenAI(
             model=api_model_name,

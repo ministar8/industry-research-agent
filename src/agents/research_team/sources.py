@@ -44,11 +44,29 @@ _FETCH_NOISE_LINE = re.compile(
 _STANDALONE_URL = re.compile(r"^https?://\S+$", re.IGNORECASE)
 
 _AUTHORITY_BASE = {4: 0.90, 3: 0.80, 2: 0.65, 1: 0.50, 0: 0.40}
+# Search does not always report authority. The unknown case sits between the lowest two
+# known levels rather than borrowing one: a missing score must not outrank a
+# known-good source, and must not sink to the bottom either.
+_AUTHORITY_UNKNOWN_BASE = 0.45
 
 # How much of a source the analyst and writer actually read. Fetch stores up to
 # MAX_CONTENT_CHARS, so a lower cap silently discards paid-for text *and* hides the
 # discard from the model, which then reads "absent" where the truth is "cut off".
 EXCERPT_CHARS = 1500
+
+# Total excerpt text one prompt may carry. Spreading it over the window keeps a wider
+# window at the same cost as a narrow one: 12 sources read 1500 characters each, 20
+# sources read 900 each. Breadth is what coverage judgements need; depth is what a
+# single-fact extraction needs, and the marker in `excerpt` tells the model which one
+# it is looking at.
+EXCERPT_BUDGET_CHARS = 18_000
+
+
+def excerpt_limit_for(source_count: int) -> int:
+    """Per-source excerpt cap under a fixed total budget."""
+    if source_count <= 0:
+        return EXCERPT_CHARS
+    return max(1, min(EXCERPT_CHARS, EXCERPT_BUDGET_CHARS // source_count))
 
 
 def clean_fetched_markdown(text: str) -> str:
@@ -109,7 +127,7 @@ def url_key(url: str) -> str:
 
 
 def confidence_from_authority(authority: int, rerank_score: float) -> float:
-    base = _AUTHORITY_BASE.get(authority, 0.45)
+    base = _AUTHORITY_BASE.get(authority, _AUTHORITY_UNKNOWN_BASE)
     if rerank_score >= 2.5:
         base += 0.10
     elif rerank_score >= 1.5:
@@ -203,8 +221,13 @@ def excerpt(text: str, limit: int = EXCERPT_CHARS) -> str:
     return f"{text[:limit]}…（节选，全文共 {len(text)} 字，此处为前 {limit} 字）"
 
 
-def numbered_sources(sources: Sequence[Source], include_excerpt: bool = True) -> str:
+def numbered_sources(
+    sources: Sequence[Source],
+    include_excerpt: bool = True,
+    excerpt_chars: int | None = None,
+) -> str:
     blocks = []
+    limit = excerpt_chars or EXCERPT_CHARS
     for index, source in enumerate(sources, start=1):
         lines = [
             f"[{index}] {source.title or source.url}",
@@ -213,10 +236,10 @@ def numbered_sources(sources: Sequence[Source], include_excerpt: bool = True) ->
             f"    来源评分: {source.confidence:.2f}"
             f"（authority {source.authority}, rerank {source.rerank_score:.2f}）",
         ]
-        # Skipping the line entirely, rather than printing a placeholder, keeps 12
-        # sources from spending tokens on "excerpt omitted" twelve times.
+        # Skipping the line entirely, rather than printing a placeholder, keeps the
+        # index-only form from spending tokens on "excerpt omitted" once per source.
         if include_excerpt:
-            body = excerpt(source.content or source.summary or source.snippet)
+            body = excerpt(source.content or source.summary or source.snippet, limit)
             lines.append(f"    摘录: {body}")
         blocks.append("\n".join(lines))
     return "\n".join(blocks)
@@ -236,6 +259,13 @@ def source_appendix(sources: Sequence[Source]) -> str:
     return "\n".join(lines)
 
 
+# Two digits is the whole citation space here (the ledger stays far below 100), and it
+# keeps a year such as `[2024]` out of the rewrite. Dropping those would damage the
+# prose instead of fixing a citation. One pattern, so clamping and remapping can never
+# disagree about what counts as an anchor.
+_ANCHOR = re.compile(r"\[(\d{1,2})\]")
+
+
 def clamp_anchors(text: str, source_count: int) -> str:
     """Drop citation anchors that do not resolve to a recorded source."""
 
@@ -243,7 +273,53 @@ def clamp_anchors(text: str, source_count: int) -> str:
         index = int(match.group(1))
         return match.group(0) if 1 <= index <= source_count else ""
 
-    return re.sub(r"\[(\d+)\]", replace, text)
+    return _ANCHOR.sub(replace, text)
+
+
+def remap_anchors(text: str, mapping: dict[int, int]) -> str:
+    """Rewrite batch-local citation numbers into ledger positions.
+
+    The analyst reads one batch numbered from 1, while the report and the appendix
+    number every source collected in the turn. Without this rewrite the same anchor
+    means two different pages in the two places, and a citation that survives looks
+    correct while pointing at the wrong article.
+    """
+    if not text:
+        return text
+
+    def replace(match: re.Match[str]) -> str:
+        index = int(match.group(1))
+        return f"[{mapping[index]}]" if index in mapping else ""
+
+    return _ANCHOR.sub(replace, text)
+
+
+def batch_window(
+    sources: Sequence[Source],
+    analyzed: set[str],
+    limit: int,
+) -> tuple[list[Source], dict[int, int]]:
+    """Return the next batch to analyse and its local-to-ledger index map.
+
+    New sources are appended to the ledger, so unread pages form a tail and the
+    window is always one contiguous slice. That is what makes a single offset
+    enough: a non-contiguous selection would make bare numbers wrong and force
+    per-source identity tokens instead.
+
+    ``mapping`` maps 1-based batch numbers to 1-based ledger positions; it is the
+    input to :func:`remap_anchors` and to the coverage normalisers.
+    """
+    if limit <= 0:
+        return [], {}
+    keys = [url_key(source.url) for source in sources]
+    start = next((index for index, key in enumerate(keys) if key not in analyzed), None)
+    if start is None:
+        # Everything has been read already. Re-reading the tail keeps a re-analysis
+        # from running on an empty window; the caller reports it as wasted work.
+        start = max(len(sources) - limit, 0)
+    window = list(sources[start : start + limit])
+    mapping = {index + 1: start + index + 1 for index in range(len(window))}
+    return window, mapping
 
 
 def join_gaps(gaps: Sequence[str] | None) -> str:

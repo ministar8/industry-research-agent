@@ -46,6 +46,16 @@ def test_get_model_qwen_disables_thinking():
         assert model.max_tokens == settings.LLM_MAX_TOKENS
 
 
+def test_get_model_glm_forces_thinking_even_when_globally_off():
+    with (
+        patch("core.settings.settings.DASHSCOPE_API_KEY", SecretStr("test_key")),
+        patch("core.settings.settings.DASHSCOPE_ENABLE_THINKING", False),
+    ):
+        model = _get_model_uncached(DashScopeModelName.GLM_53)
+        assert model.model_name == "glm-5.3"
+        assert model.extra_body == {"enable_thinking": True}
+
+
 def test_get_model_fake():
     model = get_model(FakeModelName.FAKE)
     assert isinstance(model, FakeListChatModel)

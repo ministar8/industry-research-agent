@@ -1,10 +1,12 @@
 """Tests for the per-turn metrics collector."""
 
 import logging
+import pathlib
 
 import pytest
 
 from core.metrics import (
+    Degradation,
     begin_turn,
     end_turn,
     record_degradation,
@@ -49,8 +51,8 @@ async def test_turn_line_reports_every_dimension(caplog):
     record_search(ok=False)
     record_fetch(ok=True)
     record_fetch(ok=False)
-    record_degradation("judge_fallback")
-    record_degradation("judge_fallback")  # repeated reason collapses
+    record_degradation(Degradation.JUDGE_FALLBACK)
+    record_degradation(Degradation.JUDGE_FALLBACK)  # repeated reason collapses
     await end_turn(token, "ok")
 
     line = caplog.records[-1].getMessage()
@@ -81,7 +83,7 @@ def test_recording_without_an_open_turn_is_a_noop():
     # Nodes are also called directly in tests; recording must not raise there.
     record_usage({"input_tokens": 1})
     record_search(ok=True)
-    record_degradation("whatever")
+    record_degradation(Degradation.LENGTH_RETRY)
 
 
 @pytest.mark.asyncio
@@ -172,3 +174,27 @@ async def test_snapshot_contains_runtime_context_and_error():
     finally:
         set_turn_sink(None)
     assert sink.rows[0]["error_detail"] == "RuntimeError: provider unavailable secret"
+
+
+def test_every_degradation_key_comes_from_the_enum():
+    # A string literal still logs and still looks like a real signal, so nothing but a
+    # source scan catches a typo or a key that never made it into the registry.
+    root = pathlib.Path(__file__).resolve().parents[2] / "src"
+    offenders = [
+        f"{path.relative_to(root)}:{number}"
+        for path in root.rglob("*.py")
+        for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1)
+        if 'record_degradation("' in line or 'record_degradation(f"' in line
+    ]
+
+    assert offenders == []
+
+
+def test_degradation_values_are_unique_snake_case():
+    values = [member.value for member in Degradation]
+
+    assert len(values) == len(set(values))
+    for member in Degradation:
+        assert member == member.value  # StrEnum: logs and JSON keep the plain string
+        assert member.value.islower()
+        assert " " not in member.value

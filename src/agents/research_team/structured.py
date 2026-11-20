@@ -8,6 +8,7 @@ Caps, retries and payload repair all depend on how an endpoint handles
 import json
 import logging
 import re
+import time
 from typing import Any
 
 from langchain_core.exceptions import OutputParserException
@@ -15,13 +16,29 @@ from langchain_core.messages import AnyMessage, SystemMessage
 from openai import LengthFinishReasonError
 from pydantic import BaseModel, ValidationError
 
-from core.metrics import record_degradation, record_usage
+from core.metrics import Degradation, record_degradation, record_usage
 
 logger = logging.getLogger(__name__)
 
-# Whether a provider accepts `response_format: json_schema`, keyed by model id.
-# Unknown providers are probed once; a 400 flips the entry to False for the process.
-_STRICT_SUPPORTED: dict[str, bool] = {}
+# Which providers accept `response_format: json_schema`, keyed by model id.
+#
+# A 400 here is not permanent: quota resets, a bad deployment gets replaced, a
+# transient gateway error goes away. Remembering the verdict saves a doomed call per
+# request; remembering it forever leaves the process in the weaker JSON mode until the
+# next restart, which costs parse failures and tokens on every later call. The entry
+# therefore expires and the capability is re-probed.
+STRICT_RETRY_AFTER_SECONDS = 1800.0
+_strict_blocked_until: dict[str, float] = {}
+
+
+def _strict_allowed(key: str) -> bool:
+    deadline = _strict_blocked_until.get(key)
+    return deadline is None or time.monotonic() >= deadline
+
+
+def _mark_strict_unsupported(key: str) -> None:
+    _strict_blocked_until[key] = time.monotonic() + STRICT_RETRY_AFTER_SECONDS
+
 
 _LENGTH_RETRY = SystemMessage(
     content="上一次输出超出长度上限被截断。请压缩篇幅后重新输出："
@@ -86,17 +103,17 @@ class _StructuredOutput:
             logger.warning(
                 "%s hit the completion ceiling, retrying with a tighter brief", self._key
             )
-            record_degradation("length_retry")
+            record_degradation(Degradation.LENGTH_RETRY)
             return await self._attempt([*messages, _LENGTH_RETRY])
 
     async def _attempt(self, messages: list[AnyMessage]) -> Any:
-        if _STRICT_SUPPORTED.get(self._key, True):
+        if _strict_allowed(self._key):
             try:
                 result = await self._strict_call(messages)
             except Exception as exc:
                 if not _rejects_json_schema(exc):
                     raise
-                _STRICT_SUPPORTED[self._key] = False
+                _mark_strict_unsupported(self._key)
                 logger.warning(
                     "%s rejected json_schema, falling back to JSON mode: %s", self._key, exc
                 )
@@ -227,13 +244,16 @@ def inline_schema(schema: dict[str, Any]) -> dict[str, Any]:
 def _rejects_json_schema(exc: Exception) -> bool:
     """True when the provider refuses `response_format: json_schema`.
 
-    Only a 4xx that names the field counts. A timeout, a rate limit or a schema
-    mismatch must propagate — silently degrading those to JSON mode would hide the
-    real fault behind a lower-quality path.
+    A 4xx that names the field counts, as does a serving OOM (std::bad_alloc) that
+    some endpoints raise only on json_schema requests while json_mode still works.
+    A timeout, a rate limit or a schema mismatch must propagate — silently degrading
+    those to JSON mode would hide the real fault behind a lower-quality path.
     """
     status = getattr(exc, "status_code", None)
     text = str(exc)
-    return status in {400, 422} and ("response_format" in text or "json_schema" in text)
+    if status not in {400, 422}:
+        return False
+    return "response_format" in text or "json_schema" in text or "bad_alloc" in text
 
 
 def _coerce(parsed: Any, schema: type) -> Any | None:

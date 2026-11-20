@@ -16,10 +16,63 @@ from collections.abc import Mapping
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from enum import StrEnum
 from time import perf_counter
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+
+class Degradation(StrEnum):
+    """Every fallback path a node can take, in one place.
+
+    Free-form strings made a typo invisible: it still rendered in the turn log, still
+    read like a real signal, and never failed a test. The enum is the registry, and
+    `record_degradation` only accepts members of it.
+    """
+
+    ANALYSIS_INCOMPLETE = "analysis_incomplete"
+    ANALYSIS_NO_NEW_SOURCES = "analysis_no_new_sources"
+    ANALYSIS_SOURCES_LEFT_UNREAD = "analysis_sources_left_unread"
+    COVERAGE_ALL_SOURCES_CITED = "coverage_all_sources_cited"
+    COVERAGE_CONFLICTING_STRENGTH_MISMATCH = "coverage_conflicting_strength_mismatch"
+    COVERAGE_DUPLICATE_TASK = "coverage_duplicate_task"
+    COVERAGE_INCOMPLETE = "coverage_incomplete"
+    COVERAGE_INVALID_SOURCE_INDEX = "coverage_invalid_source_index"
+    COVERAGE_MISSING_WITH_SOURCES = "coverage_missing_with_sources"
+    COVERAGE_STALE_BATCH = "coverage_stale_batch"
+    COVERAGE_STRENGTH_WITHOUT_SOURCES = "coverage_strength_without_sources"
+    COVERAGE_UNKNOWN_TASK = "coverage_unknown_task"
+    EVIDENCE_STATEMENT_CHANGE_DOWNGRADED = "evidence_statement_change_downgraded"
+    EVIDENCE_STATEMENT_EMPTY = "evidence_statement_empty"
+    EVIDENCE_STATEMENT_FORECAST_DOWNGRADED = "evidence_statement_forecast_downgraded"
+    EVIDENCE_STATEMENT_FORECAST_NOT_TREND = "evidence_statement_forecast_not_trend"
+    EVIDENCE_STATEMENT_INVALID_SOURCE_INDEX = "evidence_statement_invalid_source_index"
+    EVIDENCE_STATEMENT_TREND_DOWNGRADED = "evidence_statement_trend_downgraded"
+    EVIDENCE_STATEMENT_WITHOUT_SOURCES = "evidence_statement_without_sources"
+    JUDGE_FALLBACK = "judge_fallback"
+    LENGTH_RETRY = "length_retry"
+    QUERY_PLANNING_EMPTY = "query_planning_empty"
+    QUERY_PLANNING_FAILED = "query_planning_failed"
+    REPORT_INCOMPLETE = "report_incomplete"
+    RESEARCHER_FORCED_ANALYST = "researcher_forced_analyst"
+    SEARCH_REJECTED = "search_rejected"
+    SEARCH_RESULT_INVALID_FIELD = "search_result_invalid_field"
+    SEARCH_RESULT_INVALID_ITEM = "search_result_invalid_item"
+    SUB_QUESTIONS_MISSING = "sub_questions_missing"
+    SUBJECT_COVERAGE_ASPECT_SOURCE_MERGE = "subject_coverage_aspect_source_merge"
+    SUBJECT_COVERAGE_CONFLICTING_STRENGTH_MISMATCH = (
+        "subject_coverage_conflicting_strength_mismatch"
+    )
+    SUBJECT_COVERAGE_DUPLICATE_ASPECT = "subject_coverage_duplicate_aspect"
+    SUBJECT_COVERAGE_DUPLICATE_SUBJECT = "subject_coverage_duplicate_subject"
+    SUBJECT_COVERAGE_EMPTY_ASPECT = "subject_coverage_empty_aspect"
+    SUBJECT_COVERAGE_INCOMPLETE = "subject_coverage_incomplete"
+    SUBJECT_COVERAGE_INVALID_SOURCE_INDEX = "subject_coverage_invalid_source_index"
+    SUBJECT_COVERAGE_MISSING_WITH_SOURCES = "subject_coverage_missing_with_sources"
+    SUBJECT_COVERAGE_STALE_BATCH = "subject_coverage_stale_batch"
+    SUBJECT_COVERAGE_STRENGTH_WITHOUT_SOURCES = "subject_coverage_strength_without_sources"
+    SUBJECT_COVERAGE_UNKNOWN_SUBJECT = "subject_coverage_unknown_subject"
 
 
 @dataclass
@@ -39,7 +92,7 @@ class TurnMetrics:
     search_failed: int = 0
     fetch_failed: int = 0
     fetch_skipped: int = 0
-    degradations: list[str] = field(default_factory=list)
+    degradations: list[Degradation] = field(default_factory=list)
     filter_counts: dict[str, int] = field(default_factory=dict)
     sources_count: int = 0
     report_title: str = ""
@@ -235,7 +288,7 @@ def record_fetch_skipped() -> None:
         metrics.fetch_skipped += 1
 
 
-def record_degradation(reason: str) -> None:
+def record_degradation(reason: Degradation) -> None:
     """Mark a fallback path. Repeated reasons collapse so the line stays short."""
     metrics = _current.get()
     if metrics is not None and reason not in metrics.degradations:

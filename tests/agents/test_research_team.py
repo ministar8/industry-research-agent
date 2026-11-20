@@ -12,10 +12,25 @@ from openai import LengthFinishReasonError
 
 from agents.research_team.analyst import (
     AnalysisBundle,
-    _normalize_coverage,
-    _normalize_evidence_statements,
-    _normalize_subject_coverage,
     analyst,
+)
+from agents.research_team.contracts import (
+    AUTHORITY_UNKNOWN,
+    AspectCoverage,
+    EvidenceCoverage,
+    EvidenceStatement,
+    ResearchSubject,
+    ResearchTask,
+    Source,
+    SubjectEvidenceCoverage,
+)
+from agents.research_team.normalize import (
+    merge_lines,
+    merge_statements,
+    merge_subject_coverage,
+    normalize_coverage,
+    normalize_evidence_statements,
+    normalize_subject_coverage,
 )
 from agents.research_team.prompts import (
     PROMPTS_DIR,
@@ -27,39 +42,41 @@ from agents.research_team.researcher import (
     MAX_CONTENT_CHARS,
     SourceJudgements,
     _candidate,
+    _collect_batches,
     _deep_read,
+    _empty_run_reason,
     _filter_candidates,
     _judge,
     _plan_queries,
+    _researcher_system,
     _task_brief,
     researcher,
 )
 from agents.research_team.search import SearchRejected, SearchResponseError, fetch, search
 from agents.research_team.sources import (
+    EXCERPT_BUDGET_CHARS,
     EXCERPT_CHARS,
+    batch_window,
     clamp_anchors,
     clean_fetched_markdown,
     clean_url,
     confidence_from_authority,
     dedupe_sources,
     excerpt,
+    excerpt_limit_for,
     numbered_sources,
+    remap_anchors,
     url_key,
-)
-from agents.research_team.state import (
-    AspectCoverage,
-    EvidenceCoverage,
-    EvidenceStatement,
-    ResearchSubject,
-    ResearchTask,
-    Source,
-    SubjectEvidenceCoverage,
 )
 from agents.research_team.structured import inline_schema, structured_output
 from agents.research_team.supervisor import (
+    _TURN_RESET,
     MAX_ROUNDS,
     RoutingDecision,
+    _constraints_for,
     _enforce,
+    _recorded_target,
+    _turn_state,
     finalize,
     route,
     supervisor,
@@ -135,8 +152,8 @@ def test_normalize_coverage_matches_tasks_and_drops_invalid_source_indices():
         ),
     ]
 
-    with patch("agents.research_team.analyst.record_degradation") as degraded:
-        normalized = _normalize_coverage(coverage, tasks, source_count=2)
+    with patch("agents.research_team.normalize.record_degradation") as degraded:
+        normalized = normalize_coverage(coverage, tasks, source_count=2)
 
     assert [item.task_id for item in normalized] == ["T1", "T2"]
     assert normalized[0].question == "问题一"
@@ -159,8 +176,8 @@ def test_normalize_coverage_downgrades_impossible_evidence_strength():
         )
     ]
 
-    with patch("agents.research_team.analyst.record_degradation") as degraded:
-        normalized = _normalize_coverage(coverage, [task], source_count=1)
+    with patch("agents.research_team.normalize.record_degradation") as degraded:
+        normalized = normalize_coverage(coverage, [task], source_count=1)
 
     assert normalized[0].evidence_strength == "insufficient"
     assert degraded.call_count == 1
@@ -201,7 +218,7 @@ def test_normalize_subject_coverage_aggregates_aspects_and_fills_missing_subject
         )
     ]
 
-    normalized = _normalize_subject_coverage(coverage, subjects, source_count=2)
+    normalized = normalize_subject_coverage(coverage, subjects, source_count=2)
 
     assert [item.subject_id for item in normalized] == ["S1", "S2"]
     assert normalized[0].subject == "宁德时代"
@@ -234,8 +251,8 @@ def test_normalize_evidence_statements_downgrades_unsupported_trends():
         ),
     ]
 
-    with patch("agents.research_team.analyst.record_degradation") as degraded:
-        normalized = _normalize_evidence_statements(statements, source_count=1)
+    with patch("agents.research_team.normalize.record_degradation") as degraded:
+        normalized = normalize_evidence_statements(statements, source_count=1)
 
     assert [item.kind for item in normalized] == ["change", "forecast"]
     assert normalized[0].source_indices == [1]
@@ -253,7 +270,7 @@ def test_normalize_evidence_statements_allows_three_comparable_actual_periods():
         source_indices=[1, 2],
     )
 
-    normalized = _normalize_evidence_statements([statement], source_count=2)
+    normalized = normalize_evidence_statements([statement], source_count=2)
 
     assert normalized[0].kind == "trend"
     assert normalized[0].trend_origin == "unknown"
@@ -268,8 +285,8 @@ def test_normalize_evidence_statements_downgrades_missing_comparability_fields()
         source_indices=[1],
     )
 
-    with patch("agents.research_team.analyst.record_degradation") as degraded:
-        normalized = _normalize_evidence_statements([statement], source_count=1)
+    with patch("agents.research_team.normalize.record_degradation") as degraded:
+        normalized = normalize_evidence_statements([statement], source_count=1)
 
     assert normalized[0].kind == "change"
     assert degraded.call_count == 1
@@ -284,8 +301,23 @@ def test_route_returns_recorded_action():
     assert route({"next_action": "researcher", "rounds": 1}) == "researcher"
 
 
-def test_route_forces_finalize_past_round_limit():
-    assert route({"next_action": "researcher", "rounds": MAX_ROUNDS + 1}) == "finalize"
+def test_route_dispatches_without_rechecking_the_round_cap():
+    # Supervisor applies MAX_ROUNDS when it records next_action; route deciding again
+    # only creates a second place for the two to disagree.
+    assert route({"next_action": "researcher", "rounds": MAX_ROUNDS + 1}) == "researcher"
+
+
+def test_recorded_action_is_capped_by_the_round_limit():
+    # The cap lives in one place: supervisor records finalize, so route can dispatch
+    # state["next_action"] without re-deriving the policy.
+    state = {
+        "messages": [HumanMessage(content="调研")],
+        "sources": [make_source("https://a.example/1")],
+        "analysis": "已有分析",
+    }
+
+    assert _recorded_target(MAX_ROUNDS, decision("researcher"), state) == "researcher"
+    assert _recorded_target(MAX_ROUNDS + 1, decision("researcher"), state) == "finalize"
 
 
 def test_route_defaults_to_finalize_without_action():
@@ -1476,8 +1508,20 @@ def test_prompt_renderer_rejects_missing_and_unexpected_variables():
 # which variables a node must supply. A stray "{foo}" in prose fails here, not at render.
 _PROMPT_VARIABLES = {
     "research_team.supervisor.instructions": set(),
-    "research_team.supervisor.status": {"status"},
-    "research_team.researcher.instructions": set(),
+    "research_team.supervisor.status": {
+        "intent",
+        "tasks",
+        "subjects",
+        "constraints",
+        "source_count",
+        "analysis_done",
+        "coverage_summary",
+        "subject_coverage_count",
+        "report_done",
+        "rounds",
+        "max_rounds",
+    },
+    "research_team.researcher.instructions": {"max_query_chars"},
     "research_team.researcher.task_brief": {
         "intent",
         "questions",
@@ -1687,6 +1731,45 @@ async def test_structured_output_falls_back_when_json_schema_is_rejected():
         reason="需要检索",
     )
     model = _StrictRejectingModel(decision)
+
+    result = await structured_output(model, RoutingDecision).ainvoke([])
+
+    assert result is decision
+    assert model.methods == ["json_schema", "json_mode"]
+
+
+@pytest.mark.asyncio
+async def test_structured_output_falls_back_on_json_schema_serving_oom():
+    decision = RoutingDecision(
+        intent="测试",
+        is_research=True,
+        sub_questions=[],
+        constraints=[],
+        next="researcher",
+        reason="需要检索",
+    )
+
+    class _OomModel:
+        def __init__(self) -> None:
+            self.methods: list[str | None] = []
+
+        def with_structured_output(
+            self, schema: type, method: str | None = None, include_raw: bool = False, **kwargs
+        ) -> object:
+            self.methods.append(method)
+
+            class _Decider:
+                async def ainvoke(self, messages: list) -> dict:
+                    if method == "json_schema":
+                        raise _BadRequest(
+                            "Error code: 400 - An error occurred in model serving, "
+                            "error message is: [std::bad_alloc]"
+                        )
+                    return {"raw": None, "parsed": decision, "parsing_error": None}
+
+            return _Decider()
+
+    model = _OomModel()
 
     result = await structured_output(model, RoutingDecision).ainvoke([])
 
@@ -2254,3 +2337,946 @@ async def test_finalize_does_not_claim_the_round_cap_when_it_was_not_hit():
 
     assert "未生成成稿报告" in content
     assert "达到调度上限" not in content
+
+
+def test_remap_anchors_moves_batch_numbers_to_ledger_positions():
+    assert remap_anchors("事实甲 [1]，事实乙 [2]", {1: 13, 2: 14}) == "事实甲 [13]，事实乙 [14]"
+
+
+def test_remap_anchors_drops_unknown_numbers_and_keeps_years():
+    # [2024] is a year, not a citation; dropping it would corrupt the sentence.
+    assert remap_anchors("2024 [1] 年规模，[2024] 与 [9]", {1: 5}) == "2024 [5] 年规模，[2024] 与 "
+
+
+def test_batch_window_starts_at_the_first_unread_source():
+    sources = [Source(url=f"https://s.example/{index}") for index in range(1, 15)]
+    read = {url_key(source.url) for source in sources[:12]}
+
+    window, mapping = batch_window(sources, read, 12)
+
+    assert [source.url for source in window] == ["https://s.example/13", "https://s.example/14"]
+    assert mapping == {1: 13, 2: 14}
+
+
+def test_batch_window_falls_back_to_the_tail_when_everything_was_read():
+    sources = [Source(url=f"https://s.example/{index}") for index in range(1, 5)]
+    read = {url_key(source.url) for source in sources}
+
+    window, mapping = batch_window(sources, read, 2)
+
+    assert [source.url for source in window] == ["https://s.example/3", "https://s.example/4"]
+    assert mapping == {1: 3, 2: 4}
+
+
+def test_merge_lines_dedupes_on_whitespace_normalised_text():
+    merged = merge_lines(["事实甲 [1]"], ["事实甲  [1]", "事实乙 [2]"], 10)
+
+    assert merged == ["事实甲 [1]", "事实乙 [2]"]
+
+
+@pytest.mark.asyncio
+async def test_second_batch_reads_unread_sources_and_keeps_the_earlier_judgement():
+    captured: list[str] = []
+    sources = [
+        Source(url=f"https://s.example/{index}", title=f"来源{index}", content="正文" * 50)
+        for index in range(1, 15)
+    ]
+    bundle = AnalysisBundle(
+        facts=["新事实甲 [1]", "新事实乙 [1]"],
+        patterns=["新模式 [1]"],
+        contradictions=[],
+        gaps=["新缺口 [1]"],
+        coverage=[
+            EvidenceCoverage(
+                task_id="T1",
+                question="问题一",
+                source_indices=[1],
+                status="sufficient",
+                evidence_strength="moderate",
+                gaps=[],
+                reason="本批来源支持",
+            ),
+            # The model cannot see the first batch, so it reports this one uncovered.
+            EvidenceCoverage(
+                task_id="T2",
+                question="问题二",
+                source_indices=[],
+                status="missing",
+                evidence_strength="insufficient",
+                gaps=["本批无材料"],
+                reason="本批未涉及",
+            ),
+        ],
+    )
+    state = {
+        "messages": [HumanMessage(content="调研")],
+        "intent": "意图",
+        "tasks": [
+            ResearchTask(id="T1", question="问题一"),
+            ResearchTask(id="T2", question="问题二"),
+        ],
+        "sources": sources,
+        "analyzed_source_ids": [url_key(source.url) for source in sources[:12]],
+        "evidence_coverage": [
+            EvidenceCoverage(
+                task_id="T2",
+                question="问题二",
+                source_indices=[3],
+                status="sufficient",
+                evidence_strength="strong",
+                gaps=[],
+                reason="首批已覆盖",
+            )
+        ],
+    }
+
+    with (
+        patch("agents.research_team.analyst.settings.USE_FAKE_MODEL", False),
+        patch(
+            "agents.research_team.analyst.resolve_model",
+            return_value=_CapturingModel(bundle, captured),
+        ),
+        patch("agents.research_team.normalize.record_degradation") as degraded,
+    ):
+        result = await analyst(state, None)  # type: ignore[arg-type]
+
+    prompt = captured[0]
+    assert "来源13" in prompt
+    assert "来源14" in prompt
+    assert "来源12" not in prompt
+
+    coverage = {item.task_id: item for item in result["evidence_coverage"]}
+    # Batch-local [1] must land on its ledger position, not stay as [1].
+    assert coverage["T1"].source_indices == [13]
+    # The batch saw nothing for T2; the earlier judgement survives instead of regressing.
+    assert coverage["T2"].source_indices == [3]
+    assert coverage["T2"].status == "sufficient"
+    assert "coverage_stale_batch" in [call.args[0] for call in degraded.call_args_list]
+    assert result["analyzed_source_ids"] == [url_key(source.url) for source in sources]
+
+
+@pytest.mark.asyncio
+async def test_writer_numbers_the_whole_ledger_and_keeps_high_anchors():
+    captured: list[str] = []
+    sources = [
+        Source(url=f"https://s.example/{index}", title=f"来源{index}") for index in range(1, 31)
+    ]
+    bundle = ReportBundle(
+        title="报告",
+        summary="摘要包含关键判断 [30]。",
+        findings=["发现甲 [30]", "发现乙 [1]"],
+        analysis="分析段落解释机制与风险 [30]。",
+        conclusion="结论给出可执行判断 [1]。",
+    )
+    state = {
+        "messages": [HumanMessage(content="调研")],
+        "intent": "意图",
+        # Long analysis keeps the writer on the index-only path.
+        "analysis": "分析" * 1000,
+        "sources": sources,
+    }
+
+    with patch(
+        "agents.research_team.writer.resolve_model",
+        return_value=_CapturingModel(bundle, captured),
+    ):
+        result = await writer(state, None)  # type: ignore[arg-type]
+
+    assert "[30] 来源30" in captured[0]
+    # The ledger numbering must survive clamping, or the citation is silently lost.
+    assert "[30]" in result["report"]
+
+
+def test_normalize_coverage_drops_anchors_from_a_missing_judgement():
+    tasks = [ResearchTask(id="T1", question="问题一")]
+    coverage = [
+        EvidenceCoverage(
+            task_id="T1",
+            question="问题一",
+            source_indices=[1, 4, 6],
+            status="missing",
+            evidence_strength="insufficient",
+            gaps=["缺少排他数据"],
+            reason="只有泛泛提及",
+        )
+    ]
+
+    with patch("agents.research_team.normalize.record_degradation") as degraded:
+        result = normalize_coverage(coverage, tasks, source_count=6)
+
+    assert result[0].source_indices == []
+    assert result[0].status == "missing"
+    assert result[0].evidence_strength == "insufficient"
+    degraded.assert_any_call("coverage_missing_with_sources")
+
+
+def test_normalize_coverage_keeps_anchors_when_the_status_is_not_missing():
+    tasks = [ResearchTask(id="T1", question="问题一")]
+    coverage = [
+        EvidenceCoverage(
+            task_id="T1",
+            question="问题一",
+            source_indices=[1, 4],
+            status="partial",
+            evidence_strength="weak",
+            gaps=["缺少 2025 年数据"],
+            reason="已有两年数据",
+        )
+    ]
+
+    with patch("agents.research_team.analyst.record_degradation") as degraded:
+        result = normalize_coverage(coverage, tasks, source_count=6)
+
+    assert result[0].source_indices == [1, 4]
+    assert "coverage_missing_with_sources" not in [call.args[0] for call in degraded.call_args_list]
+
+
+def test_normalize_subject_coverage_drops_anchors_from_missing_aspects():
+    subjects = [ResearchSubject(id="S1", name="对象一")]
+    coverage = [
+        SubjectEvidenceCoverage(
+            subject_id="S1",
+            subject="对象一",
+            aspects=[
+                AspectCoverage(
+                    name="产能",
+                    status="missing",
+                    evidence_strength="insufficient",
+                    source_indices=[2],
+                    gaps=["无直接数据"],
+                    reason="仅提及规划",
+                )
+            ],
+            status="missing",
+            evidence_strength="insufficient",
+            source_indices=[2],
+            gaps=["无直接数据"],
+            reason="无",
+        )
+    ]
+
+    with patch("agents.research_team.normalize.record_degradation") as degraded:
+        result = normalize_subject_coverage(coverage, subjects, source_count=6)
+
+    assert result[0].aspects[0].source_indices == []
+    assert result[0].source_indices == []
+    degraded.assert_any_call("subject_coverage_missing_with_sources")
+
+
+def test_excerpt_limit_shrinks_as_the_window_widens():
+    assert excerpt_limit_for(0) == EXCERPT_CHARS
+    assert excerpt_limit_for(12) == EXCERPT_CHARS
+    assert excerpt_limit_for(20) == EXCERPT_BUDGET_CHARS // 20
+    assert excerpt_limit_for(30) == EXCERPT_BUDGET_CHARS // 30
+
+
+def test_excerpt_limit_never_exceeds_the_configured_cap():
+    # A short window must not spend more per source than a full-length read.
+    assert all(excerpt_limit_for(count) <= EXCERPT_CHARS for count in (1, 5, 12, 20, 60))
+
+
+@pytest.mark.asyncio
+async def test_analyst_reads_every_source_of_a_normal_haul():
+    captured: list[str] = []
+    sources = [
+        Source(url=f"https://s.example/{index}", title=f"来源{index}", content="正文" * 400)
+        for index in range(1, 17)
+    ]
+    bundle = AnalysisBundle(
+        facts=["事实甲 [1]", "事实乙 [1]"],
+        patterns=["模式 [1]"],
+        contradictions=[],
+        gaps=["缺口 [1]"],
+        coverage=[
+            EvidenceCoverage(
+                task_id="T1",
+                question="问题一",
+                source_indices=[16],
+                status="partial",
+                evidence_strength="moderate",
+                gaps=["缺少 2025 年数据"],
+                reason="已有多源数据",
+            )
+        ],
+    )
+    state = {
+        "messages": [HumanMessage(content="调研")],
+        "intent": "意图",
+        "tasks": [ResearchTask(id="T1", question="问题一")],
+        "sources": sources,
+    }
+
+    with (
+        patch("agents.research_team.analyst.settings.USE_FAKE_MODEL", False),
+        patch(
+            "agents.research_team.analyst.resolve_model",
+            return_value=_CapturingModel(bundle, captured),
+        ),
+    ):
+        result = await analyst(state, None)  # type: ignore[arg-type]
+
+    prompt = captured[0]
+    # A 16-source haul is normal; the old 12-source window dropped a quarter of it.
+    assert "[16] 来源16" in prompt
+    assert result["evidence_coverage"][0].source_indices == [16]
+    assert len(result["analyzed_source_ids"]) == 16
+
+
+def test_analyst_prompt_excerpt_budget_is_flat_across_window_sizes():
+    def total(count: int) -> int:
+        sources = [
+            Source(url=f"https://s.example/{index}", title=f"来源{index}", content="甲" * 4000)
+            for index in range(1, count + 1)
+        ]
+        return len(numbered_sources(sources, excerpt_chars=excerpt_limit_for(count)))
+
+    # Wider windows add per-source metadata, not more excerpt text.
+    assert total(20) - total(12) < 2500
+
+
+@pytest.mark.asyncio
+async def test_search_reuses_one_connection_pool_per_event_loop():
+    from agents.research_team import search as search_module
+
+    first = await search_module._shared_client(60.0)
+    second = await search_module._shared_client(30.0)
+
+    # One pool per round: a client per request pays a TLS handshake each time.
+    assert first is second
+    assert not first.is_closed
+
+    await search_module.close_shared_client()
+    assert first.is_closed
+
+
+def test_search_replaces_the_pool_when_the_event_loop_changes():
+    from agents.research_team import search as search_module
+
+    async def touch() -> object:
+        return await search_module._shared_client(60.0)
+
+    first = asyncio.run(touch())
+    # A pool belongs to the loop that created it; the stale one must be dropped, not
+    # reused, and closed rather than leaked.
+    second = asyncio.run(touch())
+    asyncio.run(search_module.close_shared_client())
+
+    assert first is not second
+
+
+@pytest.mark.asyncio
+async def test_new_turn_reset_is_shared_by_both_entry_points():
+    # Two hand-maintained reset lists had already drifted; both paths now read one
+    # table, and this asserts they still agree field by field.
+    state = {
+        "messages": [HumanMessage(content="换一个问题")],
+        "analysis": "旧分析",
+        "report": "旧报告",
+        "tasks": [ResearchTask(id="T1", question="旧问题")],
+        "subjects": [ResearchSubject(id="S1", name="旧对象")],
+        "constraints": ["旧约束"],
+        "plan_notes": "旧理由",
+        "evidence_coverage": [],
+        "facts": ["旧事实"],
+        "analyzed_source_ids": ["a.example/1"],
+        "analysis_batches": 2,
+        "analysis_patterns": ["旧模式"],
+        "analysis_contradictions": ["旧矛盾"],
+        "analysis_gaps": ["旧缺口"],
+        "rounds": 3,
+        "turn_attempted": True,
+        "abort_reason": "search_rejected",
+        "active_turn_id": "old",
+    }
+
+    reset = _turn_state(state, True, "fresh")
+    for key, value in _TURN_RESET.items():
+        assert reset[key] == value, key
+
+    with patch("agents.research_team.supervisor.settings.USE_FAKE_MODEL", True):
+        update = await supervisor(dict(state), {"configurable": {"turn_id": "new"}})
+
+    # rounds and plan_notes are written after the reset: the first is this turn's
+    # count, the second is why it routed this way.
+    assert update["rounds"] == 1
+    assert update["plan_notes"]
+    for key, value in _TURN_RESET.items():
+        if key in {"rounds", "plan_notes"}:
+            continue
+        assert update[key] == value, key
+    assert update["active_turn_id"] == "new"
+
+
+def test_clamp_anchors_keeps_a_bracketed_year():
+    # [2024] is prose, not a citation; dropping it used to leave a hole in the sentence.
+    assert clamp_anchors("2024 [1] 年 [2024] 与 [9] 数据", 5) == "2024 [1] 年 [2024] 与  数据"
+
+
+def test_unknown_authority_sits_between_the_lowest_known_levels():
+    source = Source(url="https://a.example/1")
+
+    assert source.authority == AUTHORITY_UNKNOWN
+    # Not a real level: it must not outrank known-good sources, nor sink to the floor.
+    assert (
+        confidence_from_authority(0, 0.0)
+        < confidence_from_authority(AUTHORITY_UNKNOWN, 0.0)
+        < confidence_from_authority(1, 0.0)
+    )
+
+
+def test_researcher_prompt_states_the_limit_the_adapter_enforces():
+    text = _researcher_system()[0].content
+
+    assert "128" in text
+    assert "100 个字符" not in text
+
+
+def test_strict_capability_is_reprobed_after_the_retry_window(monkeypatch):
+    from agents.research_team import structured as module
+
+    monkeypatch.setattr(module, "_strict_blocked_until", {})
+    now = module.time.monotonic()
+    module._mark_strict_unsupported("model@host")
+
+    with patch("agents.research_team.structured.time.monotonic", return_value=now + 1.0):
+        assert module._strict_allowed("model@host") is False
+
+    window = module.STRICT_RETRY_AFTER_SECONDS
+    with patch("agents.research_team.structured.time.monotonic", return_value=now + window + 1.0):
+        # The provider may have recovered; a permanent verdict would keep the process
+        # in the weaker JSON mode for its whole lifetime.
+        assert module._strict_allowed("model@host") is True
+
+
+def test_normalize_coverage_flags_a_judgement_that_cites_every_source():
+    tasks = [ResearchTask(id="T1", question="问题一")]
+    coverage = [
+        EvidenceCoverage(
+            task_id="T1",
+            question="问题一",
+            source_indices=[1, 2, 3],
+            status="sufficient",
+            evidence_strength="strong",
+            gaps=[],
+            reason="全部来源都支持",
+        )
+    ]
+
+    with patch("agents.research_team.normalize.record_degradation") as degraded:
+        normalize_coverage(coverage, tasks, source_count=3)
+
+    degraded.assert_any_call("coverage_all_sources_cited")
+
+
+def test_normalize_coverage_does_not_flag_a_selective_judgement():
+    tasks = [ResearchTask(id="T1", question="问题一")]
+    coverage = [
+        EvidenceCoverage(
+            task_id="T1",
+            question="问题一",
+            source_indices=[2],
+            status="partial",
+            evidence_strength="moderate",
+            gaps=["缺少排名"],
+            reason="只有一个来源直接支持",
+        )
+    ]
+
+    with patch("agents.research_team.analyst.record_degradation") as degraded:
+        normalize_coverage(coverage, tasks, source_count=3)
+
+    assert "coverage_all_sources_cited" not in [call.args[0] for call in degraded.call_args_list]
+
+
+def test_analysis_window_covers_a_full_retrieval_haul():
+    # Retrieval cannot collect more than MAX_CANDIDATES pages in a round, so a window
+    # at least that wide leaves nothing permanently unread. This is the only place the
+    # two constants are compared: raising the candidate cap must also raise the window,
+    # otherwise the extra pages silently never reach a judgement.
+    from agents.research_team.analyst import MAX_SOURCES_FOR_ANALYSIS
+    from agents.research_team.researcher import MAX_CANDIDATES
+
+    assert MAX_SOURCES_FOR_ANALYSIS >= MAX_CANDIDATES
+
+
+@pytest.mark.asyncio
+async def test_analyst_reports_sources_left_unread_beyond_the_window():
+    captured: list[str] = []
+    sources = [
+        Source(url=f"https://s.example/{index}", title=f"来源{index}", content="正文" * 50)
+        for index in range(1, 26)
+    ]
+    bundle = AnalysisBundle(
+        facts=["事实甲 [1]", "事实乙 [1]"],
+        patterns=["模式 [1]"],
+        contradictions=[],
+        gaps=["缺口 [1]"],
+        coverage=[
+            EvidenceCoverage(
+                task_id="T1",
+                question="问题一",
+                source_indices=[1],
+                status="partial",
+                evidence_strength="moderate",
+                gaps=[],
+                reason="单源",
+            )
+        ],
+    )
+    state = {
+        "messages": [HumanMessage(content="调研")],
+        "intent": "意图",
+        "tasks": [ResearchTask(id="T1", question="问题一")],
+        "sources": sources,
+    }
+
+    with (
+        patch("agents.research_team.analyst.settings.USE_FAKE_MODEL", False),
+        patch(
+            "agents.research_team.analyst.resolve_model",
+            return_value=_CapturingModel(bundle, captured),
+        ),
+        patch("agents.research_team.analyst.record_degradation") as degraded,
+    ):
+        result = await analyst(state, None)  # type: ignore[arg-type]
+
+    # Derived from the constant: raising the window should not fail this test for the
+    # wrong reason, only make it read more of the 25.
+    from agents.research_team.analyst import MAX_SOURCES_FOR_ANALYSIS
+
+    assert len(result["analyzed_source_ids"]) == MAX_SOURCES_FOR_ANALYSIS
+    assert "analysis_sources_left_unread" in [call.args[0] for call in degraded.call_args_list]
+
+
+@pytest.mark.asyncio
+async def test_analyst_does_not_flag_unread_when_the_window_covers_the_haul():
+    captured: list[str] = []
+    sources = [
+        Source(url=f"https://s.example/{index}", title=f"来源{index}", content="正文" * 50)
+        for index in range(1, 13)
+    ]
+    bundle = AnalysisBundle(
+        facts=["事实甲 [1]", "事实乙 [1]"],
+        patterns=["模式 [1]"],
+        contradictions=[],
+        gaps=["缺口 [1]"],
+        coverage=[
+            EvidenceCoverage(
+                task_id="T1",
+                question="问题一",
+                source_indices=[1],
+                status="partial",
+                evidence_strength="moderate",
+                gaps=[],
+                reason="单源",
+            )
+        ],
+    )
+    state = {
+        "messages": [HumanMessage(content="调研")],
+        "intent": "意图",
+        "tasks": [ResearchTask(id="T1", question="问题一")],
+        "sources": sources,
+    }
+
+    with (
+        patch("agents.research_team.analyst.settings.USE_FAKE_MODEL", False),
+        patch(
+            "agents.research_team.analyst.resolve_model",
+            return_value=_CapturingModel(bundle, captured),
+        ),
+        patch("agents.research_team.analyst.record_degradation") as degraded,
+    ):
+        result = await analyst(state, None)  # type: ignore[arg-type]
+
+    assert len(result["analyzed_source_ids"]) == 12
+    assert "analysis_sources_left_unread" not in [call.args[0] for call in degraded.call_args_list]
+
+
+def _aspect(
+    name: str = "产能",
+    *,
+    status: str = "sufficient",
+    strength: str = "strong",
+    indices: tuple[int, ...] = (1,),
+) -> AspectCoverage:
+    return AspectCoverage(
+        name=name,
+        status=status,  # type: ignore[arg-type]
+        evidence_strength=strength,  # type: ignore[arg-type]
+        source_indices=list(indices),
+        gaps=[],
+        reason="r",
+    )
+
+
+def _subject_row(
+    subject_id: str = "S1",
+    aspects: tuple[AspectCoverage, ...] = (),
+    *,
+    status: str = "sufficient",
+    strength: str = "strong",
+    indices: tuple[int, ...] = (1,),
+) -> SubjectEvidenceCoverage:
+    return SubjectEvidenceCoverage(
+        subject_id=subject_id,
+        subject="宁德时代",
+        aspects=list(aspects),
+        status=status,  # type: ignore[arg-type]
+        evidence_strength=strength,  # type: ignore[arg-type]
+        source_indices=list(indices),
+        gaps=[],
+        reason="r",
+    )
+
+
+def test_subject_coverage_drops_unknown_and_duplicate_subjects():
+    subjects = [ResearchSubject(id="S1", name="宁德时代")]
+    coverage = [
+        _subject_row("S9", (_aspect(),)),
+        _subject_row("S1", (_aspect(),)),
+        _subject_row("S1", (_aspect("工厂"),)),
+    ]
+
+    with patch("agents.research_team.normalize.record_degradation") as degraded:
+        result = normalize_subject_coverage(coverage, subjects, source_count=3)
+
+    assert [item.subject_id for item in result] == ["S1"]
+    assert [aspect.name for aspect in result[0].aspects] == ["产能"]
+    keys = [call.args[0].value for call in degraded.call_args_list]
+    assert "subject_coverage_unknown_subject" in keys
+    assert "subject_coverage_duplicate_subject" in keys
+
+
+def test_subject_coverage_skips_nameless_and_duplicate_aspects():
+    subjects = [ResearchSubject(id="S1", name="宁德时代")]
+    coverage = [
+        _subject_row(
+            aspects=(_aspect(""), _aspect("产能"), _aspect(" 产能 "), _aspect("工厂")),
+        )
+    ]
+
+    with patch("agents.research_team.normalize.record_degradation") as degraded:
+        result = normalize_subject_coverage(coverage, subjects, source_count=3)
+
+    assert [aspect.name for aspect in result[0].aspects] == ["产能", "工厂"]
+    keys = [call.args[0].value for call in degraded.call_args_list]
+    assert "subject_coverage_empty_aspect" in keys
+    assert "subject_coverage_duplicate_aspect" in keys
+
+
+def test_subject_coverage_status_follows_its_aspects():
+    subjects = [
+        ResearchSubject(id="S1", name="宁德时代"),
+        ResearchSubject(id="S2", name="比亚迪"),
+        ResearchSubject(id="S3", name="国轩高科"),
+    ]
+    coverage = [
+        _subject_row(
+            "S1",
+            (_aspect(status="conflicting", strength="moderate"), _aspect("工厂", strength="weak")),
+            status="conflicting",
+        ),
+        _subject_row("S2", (_aspect(status="partial", strength="weak"),), status="partial"),
+        _subject_row("S3", (_aspect(), _aspect("工厂", strength="moderate")), status="sufficient"),
+    ]
+
+    result = normalize_subject_coverage(coverage, subjects, source_count=3)
+
+    # conflicting wins over the others; strength is the weakest aspect, not the status'.
+    assert (result[0].status, result[0].evidence_strength) == ("conflicting", "weak")
+    assert (result[1].status, result[1].evidence_strength) == ("partial", "weak")
+    assert (result[2].status, result[2].evidence_strength) == ("sufficient", "moderate")
+
+
+def test_subject_coverage_without_aspects_is_missing_and_drops_its_sources():
+    subjects = [ResearchSubject(id="S1", name="宁德时代")]
+
+    result = normalize_subject_coverage([_subject_row("S1", ())], subjects, source_count=3)
+
+    assert (result[0].status, result[0].evidence_strength) == ("missing", "insufficient")
+    assert result[0].source_indices == []
+
+
+def test_subject_coverage_merges_aspect_sources_into_the_subject():
+    subjects = [ResearchSubject(id="S1", name="宁德时代")]
+    coverage = [
+        _subject_row(
+            aspects=(_aspect(indices=(2, 3)), _aspect("工厂", indices=(4,))),
+            indices=(1,),
+        )
+    ]
+
+    with patch("agents.research_team.normalize.record_degradation") as degraded:
+        result = normalize_subject_coverage(coverage, subjects, source_count=5)
+
+    assert result[0].source_indices == [1, 2, 3, 4]
+    assert "subject_coverage_aspect_source_merge" in [
+        c.args[0].value for c in degraded.call_args_list
+    ]
+
+
+def test_merge_subject_coverage_keeps_a_judgement_the_new_batch_cannot_see():
+    previous = [
+        _subject_row("S1", (_aspect(),), status="sufficient", strength="strong", indices=(1,))
+    ]
+    # A later batch reports the same object as missing because its evidence is elsewhere.
+    current = [_subject_row("S1", (), status="missing", strength="insufficient", indices=())]
+
+    with patch("agents.research_team.normalize.record_degradation") as degraded:
+        merged = merge_subject_coverage(previous, current)
+
+    assert merged[0].source_indices == [1]
+    assert merged[0].status == "sufficient"
+    assert "subject_coverage_stale_batch" in [c.args[0].value for c in degraded.call_args_list]
+
+
+def test_missing_coverage_with_strength_reports_one_reason_not_two():
+    # The "missing clears sources" rule runs first, so the strength repair is now the
+    # *no sources* rule; the stale missing-strength key must not appear.
+    tasks = [ResearchTask(id="T1", question="问题一")]
+    coverage = [
+        EvidenceCoverage(
+            task_id="T1",
+            question="问题一",
+            source_indices=[1],
+            status="missing",
+            evidence_strength="moderate",
+            gaps=[],
+            reason="r",
+        )
+    ]
+
+    with patch("agents.research_team.normalize.record_degradation") as degraded:
+        result = normalize_coverage(coverage, tasks, source_count=3)
+
+    keys = [call.args[0].value for call in degraded.call_args_list]
+    assert result[0].evidence_strength == "insufficient"
+    assert result[0].source_indices == []
+    assert "coverage_missing_with_sources" in keys
+    assert "coverage_strength_without_sources" in keys
+
+
+def test_conflicting_coverage_with_strong_evidence_is_capped():
+    tasks = [ResearchTask(id="T1", question="问题一")]
+    coverage = [
+        EvidenceCoverage(
+            task_id="T1",
+            question="问题一",
+            source_indices=[1],
+            status="conflicting",
+            evidence_strength="strong",
+            gaps=[],
+            reason="r",
+        )
+    ]
+
+    with patch("agents.research_team.normalize.record_degradation") as degraded:
+        result = normalize_coverage(coverage, tasks, source_count=3)
+
+    assert result[0].evidence_strength == "moderate"
+    assert "coverage_conflicting_strength_mismatch" in [
+        call.args[0].value for call in degraded.call_args_list
+    ]
+
+
+def test_duplicate_coverage_rows_are_dropped_not_merged():
+    tasks = [ResearchTask(id="T1", question="问题一")]
+    coverage = [
+        EvidenceCoverage(
+            task_id="T1",
+            question="问题一",
+            source_indices=[1],
+            status="sufficient",
+            evidence_strength="strong",
+            gaps=[],
+            reason="first",
+        ),
+        EvidenceCoverage(
+            task_id="T1",
+            question="问题一",
+            source_indices=[2],
+            status="partial",
+            evidence_strength="weak",
+            gaps=[],
+            reason="second",
+        ),
+    ]
+
+    with patch("agents.research_team.normalize.record_degradation") as degraded:
+        result = normalize_coverage(coverage, tasks, source_count=3)
+
+    assert len(result) == 1
+    assert result[0].reason == "first"
+    assert "coverage_duplicate_task" in [c.args[0].value for c in degraded.call_args_list]
+
+
+def test_subject_coverage_drops_an_out_of_range_aspect_index():
+    subjects = [ResearchSubject(id="S1", name="宁德时代")]
+
+    with patch("agents.research_team.normalize.record_degradation") as degraded:
+        result = normalize_subject_coverage(
+            [_subject_row(aspects=(_aspect(indices=(9,)),))], subjects, source_count=3
+        )
+
+    assert result[0].aspects[0].source_indices == []
+    assert result[0].aspects[0].evidence_strength == "insufficient"
+    assert "subject_coverage_invalid_source_index" in [
+        call.args[0].value for call in degraded.call_args_list
+    ]
+
+
+def test_evidence_statements_drop_empty_and_sourceless_rows():
+    def row(statement: str, indices: list[int]) -> EvidenceStatement:
+        return EvidenceStatement(
+            statement=statement,
+            kind="point",
+            period="2024",
+            periods=["2024"],
+            value_type="actual",
+            metric="销量",
+            unit="万辆",
+            source_indices=indices,
+            trend_origin="unknown",
+        )
+
+    with patch("agents.research_team.normalize.record_degradation") as degraded:
+        result = normalize_evidence_statements(
+            [row("   ", [1]), row("有数据", [9]), row("保留 [1]", [1])], source_count=3
+        )
+
+    assert [item.statement for item in result] == ["保留 [1]"]
+    keys = [call.args[0].value for call in degraded.call_args_list]
+    assert "evidence_statement_empty" in keys
+    assert "evidence_statement_without_sources" in keys
+
+
+def test_evidence_statement_keeps_the_single_period_at_the_front():
+    item = EvidenceStatement(
+        statement="2024 年销量 [1]",
+        kind="point",
+        period="2024",
+        periods=["2025"],
+        value_type="actual",
+        metric="销量",
+        unit="万辆",
+        source_indices=[1],
+        trend_origin="unknown",
+    )
+
+    result = normalize_evidence_statements([item], source_count=3)
+
+    # The declared single period wins the front slot; the list keeps both.
+    assert result[0].period == "2024"
+    assert result[0].periods == ["2024", "2025"]
+
+
+def test_evidence_statements_downgrade_shapes_their_periods_cannot_support():
+    def row(kind: str, value_type: str, periods: list[str]) -> EvidenceStatement:
+        return EvidenceStatement(
+            statement="句子 [1]",
+            kind=kind,  # type: ignore[arg-type]
+            period=periods[0],
+            periods=periods,
+            value_type=value_type,  # type: ignore[arg-type]
+            metric="销量",
+            unit="万辆",
+            source_indices=[1],
+            trend_origin="unknown",
+        )
+
+    with patch("agents.research_team.normalize.record_degradation") as degraded:
+        result = normalize_evidence_statements(
+            [
+                row("change", "actual", ["2024"]),  # one period cannot be a change
+                row("forecast", "actual", ["2024"]),  # actual data is not a forecast
+            ],
+            source_count=3,
+        )
+
+    assert [item.kind for item in result] == ["point", "point"]
+    keys = [call.args[0].value for call in degraded.call_args_list]
+    assert "evidence_statement_change_downgraded" in keys
+    assert "evidence_statement_forecast_downgraded" in keys
+
+
+def test_merge_statements_appends_only_statements_it_has_not_seen():
+    def row(statement: str, periods: list[str]) -> EvidenceStatement:
+        return EvidenceStatement(
+            statement=statement,
+            kind="point",
+            period=periods[0],
+            periods=periods,
+            value_type="actual",
+            metric="销量",
+            unit="万辆",
+            source_indices=[1],
+            trend_origin="unknown",
+        )
+
+    previous = [row("销量 100 [1]", ["2024"])]
+    current = [row("销量  100 [1]", ["2024"]), row("销量 120 [1]", ["2025"])]
+
+    merged = merge_statements(previous, current)
+
+    # Same metric/period/text collapses even with different whitespace.
+    assert [item.statement for item in merged] == ["销量 100 [1]", "销量 120 [1]"]
+
+
+@pytest.mark.parametrize(
+    ("raw_count", "failures", "filters", "expected"),
+    [
+        (
+            0,
+            2,
+            {"invalid_item": 0, "invalid_url": 0, "empty_content": 0, "duplicate": 0},
+            "未返回结果",
+        ),
+        (0, 0, {"invalid_item": 0, "invalid_url": 0, "empty_content": 0, "duplicate": 0}, "空结果"),
+        (3, 0, {"invalid_item": 1, "invalid_url": 1, "empty_content": 1, "duplicate": 0}, "全无效"),
+        (3, 0, {"invalid_item": 0, "invalid_url": 0, "empty_content": 0, "duplicate": 3}, "全重复"),
+        (
+            3,
+            0,
+            {"invalid_item": 1, "invalid_url": 0, "empty_content": 0, "duplicate": 0},
+            "过滤后无可用结果",
+        ),
+    ],
+)
+def test_empty_run_reason_explains_why_nothing_survived(
+    raw_count: int, failures: int, filters: dict[str, int], expected: str
+):
+    assert _empty_run_reason(raw_count, failures, filters) == expected
+
+
+def test_collect_batches_counts_failures_and_reraises_cancellation():
+    usable, failures, rejected = _collect_batches(
+        ["a", "b", "c"],
+        [["hit"], SearchRejected("denied"), RuntimeError("boom")],
+    )
+
+    assert usable == [("a", ["hit"])]
+    assert (failures, rejected) == (2, 1)
+
+    with pytest.raises(asyncio.CancelledError):
+        _collect_batches(["a"], [asyncio.CancelledError()])
+
+
+def test_constraints_merge_within_a_turn_and_reset_across_turns():
+    decision = RoutingDecision(
+        intent="x",
+        is_research=True,
+        sub_questions=[],
+        constraints=["地区：中国", "时间：2024"],
+        next="researcher",
+        reason="r",
+    )
+
+    # Inside a turn a later round may under-report, so the parsed set is merged in.
+    assert _constraints_for(["排除：乘用车"], decision, False) == [
+        "排除：乘用车",
+        "地区：中国",
+        "时间：2024",
+    ]
+    # A new request must not inherit the previous one's scope.
+    assert _constraints_for(["排除：乘用车"], decision, True) == ["地区：中国", "时间：2024"]

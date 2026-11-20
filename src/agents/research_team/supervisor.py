@@ -3,7 +3,8 @@
 It deliberately owns no tools. Everything it does is a decision over state.
 """
 
-from typing import Any, Literal
+from collections.abc import Sequence
+from typing import Any, Literal, cast
 
 from langchain_core.messages import AIMessage, AnyMessage
 from langchain_core.runnables import RunnableConfig
@@ -21,7 +22,7 @@ from agents.research_team.state import (
 )
 from agents.research_team.structured import structured_output
 from core import resolve_model, settings
-from core.metrics import record_degradation
+from core.metrics import Degradation, record_degradation
 
 MAX_ROUNDS = 5
 
@@ -34,6 +35,31 @@ SUPERVISOR_PROMPT = load_prompt(
     "research_team.supervisor.instructions",
     "research_team.supervisor.status",
 )
+
+# Everything a new research turn starts from. Kept as one list because the previous two
+# hand-maintained copies had already drifted: rounds, turn_attempted, constraints and
+# plan_notes were cleared on one path and kept on the other, which leaks a finished
+# turn's scope into the next request.
+_TURN_RESET: dict[str, Any] = {
+    "analysis": "",
+    "report": "",
+    "tasks": [],
+    "subjects": [],
+    "constraints": [],
+    "plan_notes": "",
+    "evidence_coverage": [],
+    "subject_coverage": [],
+    "evidence_statements": [],
+    "analyzed_source_ids": [],
+    "analysis_batches": 0,
+    "facts": [],
+    "analysis_patterns": [],
+    "analysis_contradictions": [],
+    "analysis_gaps": [],
+    "rounds": 0,
+    "turn_attempted": False,
+    "abort_reason": "",
+}
 
 
 class RoutingDecision(BaseModel):
@@ -61,21 +87,16 @@ class RoutingDecision(BaseModel):
         return data
 
 
-def _status_block(state: ResearchState) -> str:
+def _status_values(state: ResearchState) -> dict[str, str]:
+    """Collect the values the status template declares.
+
+    The wording lives in prompts/research_team/supervisor/status.md; this only gathers
+    what it needs, so editing the status block never means editing Python.
+    """
     sources = dedupe_sources(state.get("sources"))
     tasks = state.get("tasks") or []
     subjects = state.get("subjects") or []
-    task_lines = "\n".join(f"- [{t.id}] {t.question}" for t in tasks) or "（无）"
-    subject_lines = (
-        "\n".join(
-            f"- [{subject.id}] {subject.name}（别名：{'、'.join(subject.aliases) or '无'}）"
-            for subject in subjects
-        )
-        or "（无）"
-    )
-    constraint_lines = "\n".join(f"- {c}" for c in state.get("constraints") or []) or "（无）"
     coverage = state.get("evidence_coverage") or []
-    subject_coverage = state.get("subject_coverage") or []
     coverage_summary = (
         "，".join(
             f"{status} {sum(1 for item in coverage if item.status == status)}"
@@ -84,20 +105,51 @@ def _status_block(state: ResearchState) -> str:
         )
         or "（无）"
     )
-    return f"""当前调研状态：
-- 既有意图：{state.get("intent") or "（无）"}
-- 已拆解任务：
-{task_lines}
-- 已识别研究对象：
-{subject_lines}
-- 交付与范围约束：
-{constraint_lines}
-- 已采集来源：{len(sources)} 条
-- 分析完成：{"是" if state.get("analysis") else "否"}
-- 子问题证据覆盖：{coverage_summary}
-- 对象证据覆盖：{len(subject_coverage)} 条
-- 报告完成：{"是" if state.get("report") else "否"}
-- 已用调度轮次：{state.get("rounds") or 0}/{MAX_ROUNDS}"""
+    return {
+        "intent": state.get("intent") or "（无）",
+        "tasks": "\n".join(f"- [{task.id}] {task.question}" for task in tasks) or "（无）",
+        "subjects": "\n".join(
+            f"- [{subject.id}] {subject.name}（别名：{'、'.join(subject.aliases) or '无'}）"
+            for subject in subjects
+        )
+        or "（无）",
+        "constraints": "\n".join(f"- {item}" for item in state.get("constraints") or [])
+        or "（无）",
+        "source_count": str(len(sources)),
+        "analysis_done": "是" if state.get("analysis") else "否",
+        "coverage_summary": coverage_summary,
+        "subject_coverage_count": str(len(state.get("subject_coverage") or [])),
+        "report_done": "是" if state.get("report") else "否",
+        "rounds": str(state.get("rounds") or 0),
+        "max_rounds": str(MAX_ROUNDS),
+    }
+
+
+def _recorded_target(rounds: int, decision: RoutingDecision, state: ResearchState) -> NextAction:
+    """Apply the round budget, then the state preconditions.
+
+    Capping here rather than in `route` keeps `next_action` truthful: the state never
+    records a route the budget forbids, and dispatch needs no policy of its own.
+    """
+    if rounds > MAX_ROUNDS:
+        return "finalize"
+    return _enforce(decision, state)
+
+
+def _constraints_for(
+    previous: Sequence[str], decision: RoutingDecision, is_new_turn: bool
+) -> list[str]:
+    """Keep the verbatim constraint set within a turn; start clean on a new one.
+
+    A later round re-parses the same input and may under-report constraints, so the set
+    is merged rather than replaced - but only inside a turn: a new request must not
+    inherit the previous one's scope.
+    """
+    if is_new_turn:
+        return list(dict.fromkeys(decision.constraints))
+    merged = list(previous)
+    merged += [item for item in decision.constraints if item not in merged]
+    return merged
 
 
 def _enforce(decision: RoutingDecision, state: ResearchState) -> NextAction:
@@ -115,7 +167,7 @@ def _enforce(decision: RoutingDecision, state: ResearchState) -> NextAction:
         return "analyst" if has_sources else "researcher"
     if target == "researcher" and has_sources and not has_analysis:
         # Pre-analysis re-search can loop to the round cap and discard everything collected.
-        record_degradation("researcher_forced_analyst")
+        record_degradation(Degradation.RESEARCHER_FORCED_ANALYST)
         return "analyst"
     return target
 
@@ -143,22 +195,18 @@ def _is_new_turn(state: ResearchState, config: RunnableConfig | None) -> bool:
 def _turn_state(state: ResearchState, is_new_turn: bool, context_mode: str) -> ResearchState:
     if not is_new_turn:
         return state
-    return {
-        **state,
-        "analysis": "",
-        "report": "",
-        "tasks": [],
-        "subjects": [],
-        "constraints": [],
-        "plan_notes": "",
-        "sources": list(state.get("sources") or []) if context_mode == "reuse" else [],
-        "evidence_coverage": [],
-        "subject_coverage": [],
-        "evidence_statements": [],
-        "rounds": 0,
-        "turn_attempted": False,
-        "abort_reason": "",
-    }
+    # _TURN_RESET is a plain table, so the merge needs an explicit cast back to the
+    # state contract; every key in it is a real state field.
+    return cast(
+        ResearchState,
+        {
+            **state,
+            **_TURN_RESET,
+            # Reuse keeps the previous ledger, but the ids that track what Analyst read
+            # must still restart: a new question gets its own reading pass.
+            "sources": list(state.get("sources") or []) if context_mode == "reuse" else [],
+        },
+    )
 
 
 def _to_tasks(
@@ -226,15 +274,16 @@ async def supervisor(state: ResearchState, config: RunnableConfig) -> dict[str, 
         decider = structured_output(
             model, RoutingDecision, "supervisor", max_tokens=ROUTING_MAX_TOKENS
         )
-        messages: list[AnyMessage] = render_prompt(
-            SUPERVISOR_PROMPT, status=_status_block(turn_state)
-        )
+        messages: list[AnyMessage] = render_prompt(SUPERVISOR_PROMPT, **_status_values(turn_state))
         messages.extend(state["messages"][-12:])
         decision = await decider.ainvoke(messages)
 
-    target = "finalize" if rounds > MAX_ROUNDS else _enforce(decision, turn_state)
+    target = _recorded_target(rounds, decision, turn_state)
 
     update: dict[str, Any] = {
+        # Reset first so the explicit values below win: rounds is this turn's count,
+        # not the zero a fresh turn starts from.
+        **(_TURN_RESET if is_new_turn else {}),
         "intent": decision.intent,
         "next_action": target,
         "rounds": rounds,
@@ -244,25 +293,10 @@ async def supervisor(state: ResearchState, config: RunnableConfig) -> dict[str, 
 
     incoming_turn_id = _incoming_turn_id(config)
     if is_new_turn:
-        update.update(
-            {
-                "analysis": "",
-                "report": "",
-                "tasks": [],
-                "subjects": [],
-                "sources": list(turn_state.get("sources") or []),
-                "evidence_coverage": [],
-                "subject_coverage": [],
-                "evidence_statements": [],
-                "abort_reason": "",
-            }
-        )
+        update["sources"] = list(turn_state.get("sources") or [])
     if incoming_turn_id is not None:
         update["active_turn_id"] = incoming_turn_id
         update["active_context_mode"] = context_mode
-
-    if is_new_turn:
-        update["abort_reason"] = ""
 
     if target in {"researcher", "analyst", "writer"}:
         if is_new_turn:
@@ -270,7 +304,7 @@ async def supervisor(state: ResearchState, config: RunnableConfig) -> dict[str, 
             if decision.sub_questions:
                 update["tasks"] = _to_tasks(decision.sub_questions, decision.subjects)
             elif target == "researcher":
-                record_degradation("sub_questions_missing")
+                record_degradation(Degradation.SUB_QUESTIONS_MISSING)
                 update["tasks"] = (
                     _to_tasks([decision.intent], decision.subjects)
                     if decision.intent.strip()
@@ -282,25 +316,13 @@ async def supervisor(state: ResearchState, config: RunnableConfig) -> dict[str, 
         # lets finalize return a report that no longer matches the analysis.
         if turn_state.get("report"):
             update["report"] = ""
-        if target == "researcher":
-            # New sources invalidate the previous task-to-evidence mapping. Analyst
-            # will rebuild it after the additional retrieval round.
-            update["evidence_coverage"] = []
-            update["subject_coverage"] = []
-    elif is_new_turn:
-        # finalize() prefers staged output over its no-target guidance.
-        update["report"] = ""
-        update["analysis"] = ""
+        # Previous coverage is deliberately kept: Analyst merges each batch into it and
+        # only replaces a judgement that cites evidence. Clearing here would make a
+        # retrieval round erase everything the previous batch established.
 
-    # A later round re-parses the same input and may under-report constraints; merging
-    # within a turn keeps the verbatim set intact. A new turn starts fresh so the
-    # previous turn's scope does not leak into an unrelated request.
-    if is_new_turn:
-        update["constraints"] = list(dict.fromkeys(decision.constraints))
-    else:
-        merged = list(turn_state.get("constraints") or [])
-        merged += [c for c in decision.constraints if c not in merged]
-        update["constraints"] = merged
+    update["constraints"] = _constraints_for(
+        turn_state.get("constraints") or [], decision, is_new_turn
+    )
 
     return update
 
@@ -310,9 +332,8 @@ def route(state: ResearchState) -> Literal["researcher", "analyst", "writer", "f
     # looping until MAX_ROUNDS just multiplies the failures.
     if state.get("abort_reason"):
         return "finalize"
-    rounds = state.get("rounds") or 0
-    if rounds > MAX_ROUNDS:
-        return "finalize"
+    # Supervisor already applies MAX_ROUNDS when it records next_action; testing the cap
+    # again here only creates a second place for the two decisions to disagree.
     return state.get("next_action") or "finalize"
 
 

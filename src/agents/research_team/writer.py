@@ -13,20 +13,19 @@ from agents.research_team.prompts import load_prompt, render_prompt
 from agents.research_team.sources import (
     clamp_anchors,
     dedupe_sources,
+    excerpt_limit_for,
     join_gaps,
     numbered_sources,
 )
 from agents.research_team.state import ResearchState
 from agents.research_team.structured import structured_output
 from core import resolve_model, settings
-from core.metrics import record_degradation
+from core.metrics import Degradation, record_degradation
 
 logger = logging.getLogger(__name__)
 
 WRITER_PROMPT = load_prompt("research_team.writer.instructions")
 _WRITER_CONTEXT_PROMPT = load_prompt("research_team.writer.context")
-
-MAX_SOURCES_FOR_REPORT = 12
 
 # Writer turns analysis into prose; it does not need the raw excerpts to do that.
 # Measured on the same sources: feeding 12 excerpts cost 13k input tokens and produced
@@ -265,12 +264,15 @@ def _is_complete(bundle: ReportBundle) -> bool:
 
 
 async def writer(state: ResearchState, config: RunnableConfig) -> dict[str, Any]:
+    # Numbered over the whole ledger, never sliced: Analyst cites ledger positions, so a
+    # shorter table would leave every anchor above the cut unresolvable and clamping
+    # would delete those citations from the report. The table is index-only by default
+    # (~120 characters per source); when excerpts are needed they share the analyst's
+    # budget instead of growing with the ledger.
     sources = dedupe_sources(state.get("sources"))
     analysis = state.get("analysis") or ""
     if not analysis:
         return {"messages": [AIMessage(content="分析结果为空，无法撰写报告。")]}
-
-    sources = sources[:MAX_SOURCES_FOR_REPORT]
 
     if settings.USE_FAKE_MODEL:
         return {
@@ -283,6 +285,7 @@ async def writer(state: ResearchState, config: RunnableConfig) -> dict[str, Any]
     structured = structured_output(model, report_schema(constraints_list), "writer")
     constraints = "\n".join(f"- {c}" for c in constraints_list) or "（无）"
     include_excerpts = INCLUDE_SOURCE_EXCERPTS or len(analysis) < MIN_ANALYSIS_CHARS_FOR_INDEX
+    excerpt_chars = excerpt_limit_for(len(sources)) if include_excerpts else None
     messages = render_prompt(WRITER_PROMPT) + render_prompt(
         _WRITER_CONTEXT_PROMPT,
         intent=state.get("intent") or "（未解析）",
@@ -291,12 +294,12 @@ async def writer(state: ResearchState, config: RunnableConfig) -> dict[str, Any]
         coverage=_coverage_brief(state),
         subject_coverage=_subject_coverage_brief(state),
         evidence_statements=_evidence_statements_brief(state),
-        sources=numbered_sources(sources, include_excerpts),
+        sources=numbered_sources(sources, include_excerpts, excerpt_chars),
     )
     bundle: ReportBundle = await structured.ainvoke(messages)
     if not _is_complete(bundle):
         logger.warning("Writer returned an incomplete report, retrying once")
-        record_degradation("report_incomplete")
+        record_degradation(Degradation.REPORT_INCOMPLETE)
         bundle = await structured.ainvoke([*messages, _COMPLETENESS_REMINDER])
         if not _is_complete(bundle):
             logger.warning("Writer report still incomplete after retry")

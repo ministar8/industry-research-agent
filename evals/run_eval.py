@@ -136,6 +136,10 @@ async def run_case(case: dict, model: str) -> dict:
         ],
         "source_count": len(sources),
         "fetched_count": sum(1 for source in sources if source.content),
+        # Batches and pages-read make "did analysis actually see the later evidence?"
+        # answerable from the artifact instead of from a re-run.
+        "analysis_batches": state.get("analysis_batches") or 0,
+        "sources_analyzed": len(state.get("analyzed_source_ids") or []),
         "metrics": {
             "llm_calls": metrics.llm_calls if metrics else 0,
             "tokens_in": metrics.input_tokens if metrics else 0,

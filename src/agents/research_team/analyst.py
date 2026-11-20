@@ -1,6 +1,7 @@
 """Analyst: clean, deduplicate, cross-validate, and structure the collected sources."""
 
 import logging
+from collections.abc import Sequence
 from typing import Any
 
 from langchain_core.messages import AIMessage, SystemMessage
@@ -8,28 +9,54 @@ from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, Field
 
 from agents.research_team.contracts import (
-    AspectCoverage,
     EvidenceCoverage,
     EvidenceStatement,
-    ResearchSubject,
-    ResearchTask,
     SubjectEvidenceCoverage,
 )
+from agents.research_team.normalize import (
+    MAX_MERGED_CONTRADICTIONS,
+    MAX_MERGED_FACTS,
+    MAX_MERGED_GAPS,
+    MAX_MERGED_PATTERNS,
+    merge_coverage,
+    merge_lines,
+    merge_statements,
+    merge_subject_coverage,
+    normalize_coverage,
+    normalize_evidence_statements,
+    normalize_subject_coverage,
+    to_ledger_coverage,
+    to_ledger_statements,
+    to_ledger_subject_coverage,
+)
 from agents.research_team.prompts import load_prompt, render_prompt
-from agents.research_team.sources import dedupe_sources, join_gaps, numbered_sources
+from agents.research_team.sources import (
+    batch_window,
+    dedupe_sources,
+    excerpt_limit_for,
+    join_gaps,
+    numbered_sources,
+    remap_anchors,
+    url_key,
+)
 from agents.research_team.state import (
     ResearchState,
 )
 from agents.research_team.structured import structured_output
 from core import resolve_model, settings
-from core.metrics import record_degradation
+from core.metrics import Degradation, record_degradation
 
 logger = logging.getLogger(__name__)
 
 ANALYST_PROMPT = load_prompt("research_team.analyst.instructions")
 _ANALYST_CONTEXT_PROMPT = load_prompt("research_team.analyst.context")
 
-MAX_SOURCES_FOR_ANALYSIS = 12
+# One pass over the sources collected in a single retrieval round. Retrieval in this
+# graph is effectively single-round (supervisor forces analysis before a second search),
+# so the window has to cover a normal haul in one call: observed hauls are 7-16 pages.
+# Excerpts are spread over the budget rather than capped per source, which keeps the
+# wider window at the same token cost.
+MAX_SOURCES_FOR_ANALYSIS = 20
 
 # The fact base is prose-heavy but bounded; this leaves several times the normal
 # output as headroom while still capping a degenerate runaway generation.
@@ -63,266 +90,51 @@ class AnalysisBundle(BaseModel):
     )
 
 
-def _normalize_coverage(
-    coverage: list[EvidenceCoverage],
-    tasks: list[ResearchTask],
-    source_count: int,
-) -> list[EvidenceCoverage]:
-    by_task: dict[str, EvidenceCoverage] = {}
-    for item in coverage:
-        if item.task_id not in {task.id for task in tasks}:
-            logger.warning("Analyst returned coverage for unknown task %s", item.task_id)
-            record_degradation("coverage_unknown_task")
-            continue
-        if item.task_id in by_task:
-            logger.warning("Analyst returned duplicate coverage for task %s", item.task_id)
-            record_degradation("coverage_duplicate_task")
-            continue
-        valid_indices = [index for index in item.source_indices if 1 <= index <= source_count]
-        if len(valid_indices) != len(item.source_indices):
-            logger.warning("Analyst returned invalid source indices for task %s", item.task_id)
-            record_degradation("coverage_invalid_source_index")
-        strength = item.evidence_strength
-        if not valid_indices and strength != "insufficient":
-            logger.warning(
-                "Coverage task %s has no sources but strength %s", item.task_id, strength
-            )
-            record_degradation("coverage_strength_without_sources")
-            strength = "insufficient"
-        elif item.status == "missing" and strength != "insufficient":
-            logger.warning("Coverage task %s is missing but strength is %s", item.task_id, strength)
-            record_degradation("coverage_missing_strength_mismatch")
-            strength = "insufficient"
-        elif item.status == "conflicting" and strength == "strong":
-            logger.warning("Coverage task %s is conflicting but strength is strong", item.task_id)
-            record_degradation("coverage_conflicting_strength_mismatch")
-            strength = "moderate"
-        by_task[item.task_id] = item.model_copy(
-            update={"source_indices": valid_indices, "evidence_strength": strength}
-        )
+def _remap_bundle_text(bundle: AnalysisBundle, mapping: dict[int, int]) -> AnalysisBundle:
+    """Move every free-text citation the model wrote into ledger numbering."""
 
-    normalized: list[EvidenceCoverage] = []
-    for task in tasks:
-        item = by_task.get(task.id)
-        if item is None:
-            logger.warning("Analyst omitted coverage for task %s", task.id)
-            record_degradation("coverage_incomplete")
-            normalized.append(
-                EvidenceCoverage(
-                    task_id=task.id,
-                    question=task.question,
-                    source_indices=[],
-                    status="missing",
-                    evidence_strength="insufficient",
-                    gaps=["未生成该子问题的覆盖判断"],
-                    reason="Analyst 未返回该子问题的覆盖记录",
-                )
-            )
-            continue
-        if item.question != task.question:
-            item = item.model_copy(update={"question": task.question})
-        normalized.append(item)
-    return normalized
+    def remap(lines: Sequence[str]) -> list[str]:
+        return [remap_anchors(line, mapping) for line in lines]
 
-
-_STRENGTH_ORDER = {"insufficient": 0, "weak": 1, "moderate": 2, "strong": 3}
-
-
-def _normalize_subject_coverage(
-    coverage: list[SubjectEvidenceCoverage],
-    subjects: list[ResearchSubject],
-    source_count: int,
-) -> list[SubjectEvidenceCoverage]:
-    known = {subject.id: subject for subject in subjects}
-    by_subject: dict[str, SubjectEvidenceCoverage] = {}
-    for item in coverage:
-        subject = known.get(item.subject_id)
-        if subject is None:
-            logger.warning("Analyst returned coverage for unknown subject %s", item.subject_id)
-            record_degradation("subject_coverage_unknown_subject")
-            continue
-        if item.subject_id in by_subject:
-            logger.warning("Analyst returned duplicate coverage for subject %s", item.subject_id)
-            record_degradation("subject_coverage_duplicate_subject")
-            continue
-
-        aspects: list[AspectCoverage] = []
-        seen_aspects: set[str] = set()
-        for aspect in item.aspects:
-            name = aspect.name.strip()
-            if not name or name in seen_aspects:
-                if not name:
-                    record_degradation("subject_coverage_empty_aspect")
-                else:
-                    record_degradation("subject_coverage_duplicate_aspect")
-                continue
-            seen_aspects.add(name)
-            valid_indices = sorted(
-                {index for index in aspect.source_indices if 1 <= index <= source_count}
-            )
-            if len(valid_indices) != len(set(aspect.source_indices)):
-                record_degradation("subject_coverage_invalid_source_index")
-            strength = aspect.evidence_strength
-            if not valid_indices and strength != "insufficient":
-                strength = "insufficient"
-                record_degradation("subject_coverage_strength_without_sources")
-            if aspect.status == "missing" and strength != "insufficient":
-                strength = "insufficient"
-                record_degradation("subject_coverage_missing_strength_mismatch")
-            if aspect.status == "conflicting" and strength == "strong":
-                strength = "moderate"
-                record_degradation("subject_coverage_conflicting_strength_mismatch")
-            aspects.append(
-                aspect.model_copy(
+    return bundle.model_copy(
+        update={
+            "facts": remap(bundle.facts),
+            "patterns": remap(bundle.patterns),
+            "contradictions": remap(bundle.contradictions),
+            "gaps": remap(bundle.gaps),
+            "coverage": [
+                item.model_copy(
                     update={
-                        "name": name,
-                        "source_indices": valid_indices,
-                        "evidence_strength": strength,
+                        "gaps": remap(item.gaps),
+                        "reason": remap_anchors(item.reason, mapping),
                     }
                 )
-            )
-
-        subject_indices = sorted(
-            {index for index in item.source_indices if 1 <= index <= source_count}
-            | {index for aspect in aspects for index in aspect.source_indices}
-        )
-        if len(subject_indices) != len(
-            {index for index in item.source_indices if 1 <= index <= source_count}
-        ):
-            record_degradation("subject_coverage_aspect_source_merge")
-
-        statuses = [aspect.status for aspect in aspects]
-        if not statuses or all(status == "missing" for status in statuses):
-            status = "missing"
-        elif "conflicting" in statuses:
-            status = "conflicting"
-        elif any(status in {"missing", "partial"} for status in statuses):
-            status = "partial"
-        else:
-            status = "sufficient"
-
-        if status == "missing" or not aspects:
-            strength = "insufficient"
-        else:
-            strength = min(
-                (aspect.evidence_strength for aspect in aspects),
-                key=lambda value: _STRENGTH_ORDER[value],
-            )
-            if status == "conflicting" and strength == "strong":
-                strength = "moderate"
-
-        gaps = list(dict.fromkeys(item.gaps + [gap for aspect in aspects for gap in aspect.gaps]))
-        by_subject[item.subject_id] = item.model_copy(
-            update={
-                "subject": subject.name,
-                "aspects": aspects,
-                "source_indices": subject_indices,
-                "status": status,
-                "evidence_strength": strength,
-                "gaps": gaps,
-            }
-        )
-
-    normalized: list[SubjectEvidenceCoverage] = []
-    for subject in subjects:
-        item = by_subject.get(subject.id)
-        if item is None:
-            logger.warning("Analyst omitted coverage for subject %s", subject.id)
-            record_degradation("subject_coverage_incomplete")
-            normalized.append(
-                SubjectEvidenceCoverage(
-                    subject_id=subject.id,
-                    subject=subject.name,
-                    aspects=[],
-                    status="missing",
-                    evidence_strength="insufficient",
-                    source_indices=[],
-                    gaps=["未生成该对象的覆盖判断"],
-                    reason="Analyst 未返回该对象的覆盖记录",
+                for item in bundle.coverage
+            ],
+            "subject_coverage": [
+                item.model_copy(
+                    update={
+                        "gaps": remap(item.gaps),
+                        "reason": remap_anchors(item.reason, mapping),
+                        "aspects": [
+                            aspect.model_copy(
+                                update={
+                                    "gaps": remap(aspect.gaps),
+                                    "reason": remap_anchors(aspect.reason, mapping),
+                                }
+                            )
+                            for aspect in item.aspects
+                        ],
+                    }
                 )
-            )
-        else:
-            normalized.append(item)
-    return normalized
-
-
-def _normalize_evidence_statements(
-    statements: list[EvidenceStatement],
-    source_count: int,
-) -> list[EvidenceStatement]:
-    normalized: list[EvidenceStatement] = []
-    for item in statements:
-        statement = item.statement.strip()
-        if not statement:
-            record_degradation("evidence_statement_empty")
-            continue
-        source_indices = sorted(
-            {index for index in item.source_indices if 1 <= index <= source_count}
-        )
-        if not source_indices:
-            record_degradation("evidence_statement_without_sources")
-            continue
-        if len(source_indices) != len(set(item.source_indices)):
-            record_degradation("evidence_statement_invalid_source_index")
-
-        periods = list(dict.fromkeys(period.strip() for period in item.periods if period.strip()))
-        if item.period and item.period.strip() not in periods:
-            periods.insert(0, item.period.strip())
-        kind = item.kind
-        trend_origin = item.trend_origin
-        if kind == "trend":
-            if item.value_type in {"planned", "forecast"}:
-                kind = "forecast"
-                trend_origin = "unknown"
-                record_degradation("evidence_statement_forecast_not_trend")
-                normalized.append(
-                    item.model_copy(
-                        update={
-                            "statement": statement,
-                            "kind": kind,
-                            "period": periods[0] if periods else item.period,
-                            "periods": periods,
-                            "metric": item.metric.strip() if item.metric else item.metric,
-                            "unit": item.unit.strip() if item.unit else item.unit,
-                            "source_indices": source_indices,
-                            "trend_origin": trend_origin,
-                        }
-                    )
-                )
-                continue
-            explicit = trend_origin == "explicit_source_statement"
-            comparable = (
-                len(periods) >= 3
-                and item.value_type in {"actual", "reported"}
-                and bool(item.metric and item.metric.strip())
-                and bool(item.unit and item.unit.strip())
-            )
-            if not explicit and not comparable:
-                kind = "change" if len(periods) >= 2 else "point"
-                trend_origin = "unknown"
-                record_degradation("evidence_statement_trend_downgraded")
-        elif kind == "change" and len(periods) < 2:
-            kind = "point"
-            record_degradation("evidence_statement_change_downgraded")
-        elif kind == "forecast" and item.value_type not in {"planned", "forecast"}:
-            kind = "change" if len(periods) >= 2 else "point"
-            record_degradation("evidence_statement_forecast_downgraded")
-
-        normalized.append(
-            item.model_copy(
-                update={
-                    "statement": statement,
-                    "kind": kind,
-                    "period": periods[0] if periods else item.period,
-                    "periods": periods,
-                    "metric": item.metric.strip() if item.metric else item.metric,
-                    "unit": item.unit.strip() if item.unit else item.unit,
-                    "source_indices": source_indices,
-                    "trend_origin": trend_origin,
-                }
-            )
-        )
-    return normalized
+                for item in bundle.subject_coverage
+            ],
+            "evidence_statements": [
+                item.model_copy(update={"statement": remap_anchors(item.statement, mapping)})
+                for item in bundle.evidence_statements
+            ],
+        }
+    )
 
 
 def render_analysis(bundle: AnalysisBundle, coverage: list[EvidenceCoverage]) -> str:
@@ -375,9 +187,21 @@ def render_analysis(bundle: AnalysisBundle, coverage: list[EvidenceCoverage]) ->
 
 
 async def analyst(state: ResearchState, config: RunnableConfig) -> dict[str, Any]:
-    sources = dedupe_sources(state.get("sources"))[:MAX_SOURCES_FOR_ANALYSIS]
+    ledger = dedupe_sources(state.get("sources"))
+    read = set(state.get("analyzed_source_ids") or [])
+    sources, mapping = batch_window(ledger, read, MAX_SOURCES_FOR_ANALYSIS)
     if not sources:
         return {"messages": [AIMessage(content="来源为空，无法进入分析阶段。")]}
+    if all(url_key(source.url) in read for source in sources):
+        # No unread material: the window fell back to the tail, so this call re-reads
+        # pages already analysed. Visible so the wasted round can be traced.
+        record_degradation(Degradation.ANALYSIS_NO_NEW_SOURCES)
+    pending = len(ledger) - len(read) - len(sources)
+    if pending > 0:
+        # One visit reads one batch. Whatever is left stays unread for the whole turn,
+        # so the appendix would list pages no judgement ever saw.
+        logger.warning("%d sources left unread after this analysis batch", pending)
+        record_degradation(Degradation.ANALYSIS_SOURCES_LEFT_UNREAD)
 
     if settings.USE_FAKE_MODEL:
         return {
@@ -406,19 +230,45 @@ async def analyst(state: ResearchState, config: RunnableConfig) -> dict[str, Any
         tasks=task_lines,
         subjects=subject_lines,
         constraints=constraints,
-        sources=numbered_sources(sources),
+        sources=numbered_sources(sources, excerpt_chars=excerpt_limit_for(len(sources))),
     )
     bundle: AnalysisBundle = await structured.ainvoke(messages)
     if len([item for item in bundle.facts if item.strip()]) < 2:
         # Schema already forbids an empty list; this catches a list of blank strings.
         logger.warning("Analyst returned a thin fact base, retrying once")
-        record_degradation("analysis_incomplete")
+        record_degradation(Degradation.ANALYSIS_INCOMPLETE)
         bundle = await structured.ainvoke([*messages, _THIN_ANALYSIS_RETRY])
-    coverage = _normalize_coverage(bundle.coverage, tasks, len(sources))
-    subject_coverage = _normalize_subject_coverage(bundle.subject_coverage, subjects, len(sources))
-    evidence_statements = _normalize_evidence_statements(bundle.evidence_statements, len(sources))
+    bundle = _remap_bundle_text(bundle, mapping)
+    # Normalise against the batch first: the model only ever sees 1..len(sources).
+    coverage = to_ledger_coverage(normalize_coverage(bundle.coverage, tasks, len(sources)), mapping)
+    subject_coverage = to_ledger_subject_coverage(
+        normalize_subject_coverage(bundle.subject_coverage, subjects, len(sources)), mapping
+    )
+    evidence_statements = to_ledger_statements(
+        normalize_evidence_statements(bundle.evidence_statements, len(sources)), mapping
+    )
+
+    # Carry what earlier batches established. Analyst output replaces the state, so
+    # without this merge a second batch would erase evidence it was never shown.
+    coverage = merge_coverage(state.get("evidence_coverage") or [], coverage)
+    subject_coverage = merge_subject_coverage(state.get("subject_coverage") or [], subject_coverage)
+    evidence_statements = merge_statements(
+        state.get("evidence_statements") or [], evidence_statements
+    )
+    facts = merge_lines(state.get("facts") or [], bundle.facts, MAX_MERGED_FACTS)
+    patterns = merge_lines(
+        state.get("analysis_patterns") or [], bundle.patterns, MAX_MERGED_PATTERNS
+    )
+    contradictions = merge_lines(
+        state.get("analysis_contradictions") or [], bundle.contradictions, MAX_MERGED_CONTRADICTIONS
+    )
+    gaps = merge_lines(state.get("analysis_gaps") or [], bundle.gaps, MAX_MERGED_GAPS)
     bundle = bundle.model_copy(
         update={
+            "facts": facts,
+            "patterns": patterns,
+            "contradictions": contradictions,
+            "gaps": gaps,
             "subject_coverage": subject_coverage,
             "evidence_statements": evidence_statements,
         }
@@ -436,5 +286,15 @@ async def analyst(state: ResearchState, config: RunnableConfig) -> dict[str, Any
         "evidence_coverage": coverage,
         "subject_coverage": subject_coverage,
         "evidence_statements": evidence_statements,
+        "facts": facts,
+        "analysis_patterns": patterns,
+        "analysis_contradictions": contradictions,
+        "analysis_gaps": gaps,
+        "analyzed_source_ids": list(
+            dict.fromkeys(
+                [*(state.get("analyzed_source_ids") or []), *(url_key(s.url) for s in sources)]
+            )
+        ),
+        "analysis_batches": (state.get("analysis_batches") or 0) + 1,
         "messages": [AIMessage(content=summary)],
     }
